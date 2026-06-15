@@ -397,7 +397,14 @@ impl<'a> QueryService<'a> {
                 }
             }
         }
-        out.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.start_line.cmp(&b.start_line)));
+        out.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.name.cmp(&b.name))
+                .then(a.id.cmp(&b.id))
+                .then(a.kind.as_str().cmp(b.kind.as_str()))
+        });
         Ok(out)
     }
 
