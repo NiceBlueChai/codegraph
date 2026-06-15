@@ -223,6 +223,22 @@ fn query_kind_filter_is_applied_before_limit() {
 }
 
 #[test]
+fn query_invalid_kind_returns_empty_json_results() {
+    let dir = fixture_project();
+    let output = run_codegraph(
+        &["query", "helper", "--kind", "typo", "--json"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("query stdout is json");
+    let results = value["results"].as_array().expect("results array");
+
+    assert!(results.is_empty(), "invalid kind returned results:\n{value}");
+    assert_eq!(value["total"], 0);
+}
+
+#[test]
 fn explore_returns_source_without_prior_query() {
     let dir = fixture_project();
     let output = run_codegraph(&["explore", "runApp helper", "--max-files", "2"], dir.path());
@@ -231,4 +247,19 @@ fn explore_returns_source_without_prior_query() {
     assert!(out.contains("### Sources"), "expected sources section:\n{out}");
     assert!(out.contains("runApp"), "expected matching symbol:\n{out}");
     assert!(out.contains("helper"), "expected related symbol:\n{out}");
+}
+
+#[test]
+fn explore_warns_and_succeeds_when_indexed_source_is_missing() {
+    let dir = fixture_project();
+    fs::remove_file(dir.path().join("app.ts")).expect("remove indexed file");
+
+    let output = run_codegraph(&["explore", "runApp", "--max-files", "2"], dir.path());
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(
+        out.contains("Warning") || out.contains("failed to read"),
+        "expected missing-file warning:\n{out}"
+    );
 }

@@ -601,26 +601,11 @@ fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_query(path: &str, query: &str, limit: usize, kind: Option<&str>, json: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
-
-    let options = codegraph::types::SearchOptions {
-        limit,
-        kinds: kind.map(|k| {
-            k.split(',')
-                .filter_map(|s| codegraph::types::NodeKind::from_str(s.trim()))
-                .collect()
-        }),
-        file_pattern: None,
-    };
-    let results = queries.search_nodes(query, Some(&options))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
+    let results = service.search(query, limit, kind)?;
 
     if json {
         let output = serde_json::json!({

@@ -308,11 +308,23 @@ impl<'a> QueryService<'a> {
                 continue;
             }
 
-            let view = self.file_view(
+            let view = match self.file_view(
                 &node.file_path,
                 Some((node.start_line as usize).saturating_sub(1).max(1)),
                 Some(source_window_len(node)),
-            )?;
+            ) {
+                Ok(view) => view,
+                Err(error) => {
+                    out.push('\n');
+                    out.push_str(&context_formatter::symbol_heading(node));
+                    out.push('\n');
+                    out.push_str(&format!(
+                        "> Warning: failed to read {}: {}\n",
+                        node.file_path, error
+                    ));
+                    continue;
+                }
+            };
             out.push('\n');
             out.push_str(&context_formatter::symbol_heading(node));
             out.push('\n');
