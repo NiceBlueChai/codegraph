@@ -434,6 +434,10 @@ fn cmd_init(path: &str, verbose: bool) -> anyhow::Result<()> {
     println!("✓ CodeGraph initialized in {}", path);
     println!("  Database: {}", db_path);
 
+    // Auto-index after init (matching TS behavior)
+    println!();
+    cmd_index(path, false, false, verbose)?;
+
     Ok(())
 }
 
@@ -510,6 +514,7 @@ fn cmd_sync(path: &str, quiet: bool) -> anyhow::Result<()> {
 
 fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
+    use std::fs;
 
     if !codegraph::db::is_initialized(path) {
         if json {
@@ -524,26 +529,55 @@ fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
     let queries = QueryBuilder::new(db.get_conn());
     let stats = queries.get_stats()?;
+    let nodes_by_kind = queries.get_nodes_by_kind_counts().unwrap_or_default();
+    let languages: Vec<String> = queries.get_languages().unwrap_or_default();
+    let files_by_lang = queries.get_file_counts_by_language().unwrap_or_default();
+
+    // Get DB file size
+    let db_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     if json {
         let output = serde_json::json!({
             "initialized": true,
+            "version": env!("CARGO_PKG_VERSION"),
             "backend": format!("{:?}", db.get_backend()),
             "journal_mode": db.get_journal_mode().unwrap_or_else(|_| "unknown".to_string()),
             "nodes": stats.node_count,
             "edges": stats.edge_count,
             "files": stats.file_count,
             "unresolved_refs": stats.unresolved_ref_count,
+            "db_size_bytes": db_size_bytes,
+            "nodes_by_kind": nodes_by_kind.iter().map(|(k, c)| serde_json::json!({"kind": k, "count": c})).collect::<Vec<_>>(),
+            "languages": languages,
+            "files_by_language": files_by_lang.iter().map(|(l, c)| serde_json::json!({"language": l, "count": c})).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("CodeGraph Status:");
+        println!("  Version: {}", env!("CARGO_PKG_VERSION"));
         println!("  Backend: {:?}", db.get_backend());
         println!("  Journal Mode: {}", db.get_journal_mode().unwrap_or_else(|_| "unknown".to_string()));
         println!("  Nodes: {}", stats.node_count);
         println!("  Edges: {}", stats.edge_count);
         println!("  Files: {}", stats.file_count);
         println!("  Unresolved Refs: {}", stats.unresolved_ref_count);
+        println!("  DB Size: {:.1} MB", db_size_bytes as f64 / 1_048_576.0);
+
+        // Nodes by kind
+        if !nodes_by_kind.is_empty() {
+            println!("\n  Nodes by kind:");
+            for (kind, count) in &nodes_by_kind {
+                println!("    {:15} {}", format!("{}:", kind), count);
+            }
+        }
+
+        // Files by language
+        if !files_by_lang.is_empty() {
+            println!("\n  Files by language:");
+            for (lang, count) in &files_by_lang {
+                println!("    {:15} {}", format!("{}:", lang), count);
+            }
+        }
     }
 
     Ok(())
@@ -632,6 +666,7 @@ fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()
 fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
     use codegraph::core::query::GraphTraverser;
+    use std::collections::HashSet;
 
     if !codegraph::db::is_initialized(path) {
         anyhow::bail!("CodeGraph not initialized");
@@ -640,14 +675,46 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
     let db_path = get_database_path(path);
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
     let queries = QueryBuilder::new(db.get_conn());
-    let traverser = GraphTraverser { queries };
 
-    let callers = traverser.get_callers(symbol, 1).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Search for symbol first
+    let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
+    let results = queries.search_nodes(symbol, Some(&options))?;
+
+    // Filter to exact name matches (exact or qualified name with :: suffix)
+    let exact_matches: Vec<_> = results.iter().filter(|r| {
+        r.node.name == symbol || r.node.qualified_name.ends_with(&format!("::{}", symbol))
+    }).collect();
+
+    // Fall back to top match if exact filter removes everything
+    let matches: Vec<_> = if exact_matches.is_empty() {
+        results.iter().take(1).collect()
+    } else {
+        exact_matches
+    };
+
+    if matches.is_empty() {
+        println!("No matching symbols found for '{}'", symbol);
+        return Ok(());
+    }
+
+    // Get callers with deduplication
+    let traverser = GraphTraverser { queries };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all_callers: Vec<(codegraph::types::Node, codegraph::types::Edge)> = Vec::new();
+
+    for result in &matches {
+        let callers = traverser.get_callers(&result.node.id, 1).map_err(|e| anyhow::anyhow!("{}", e))?;
+        for (node, edge) in callers {
+            if seen.insert(node.id.clone()) {
+                all_callers.push((node, edge));
+            }
+        }
+    }
 
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
-            "callers": callers.iter().take(limit).map(|(node, edge)| {
+            "callers": all_callers.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
                     "file": node.file_path,
@@ -656,15 +723,15 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
                     "edge_kind": edge.kind.as_str(),
                 })
             }).collect::<Vec<_>>(),
-            "total": callers.len(),
+            "total": all_callers.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        if callers.is_empty() {
+        if all_callers.is_empty() {
             println!("No callers found for '{}'", symbol);
         } else {
-            println!("Callers of '{}' ({}):", symbol, callers.len());
-            for (node, edge) in callers.iter().take(limit) {
+            println!("Callers of '{}' ({}):", symbol, all_callers.len());
+            for (node, _) in all_callers.iter().take(limit) {
                 println!("  - {} ({}) at {}:{}", node.name, node.kind.as_str(), node.file_path, node.start_line);
             }
         }
@@ -676,6 +743,7 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
 fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
     use codegraph::core::query::GraphTraverser;
+    use std::collections::HashSet;
 
     if !codegraph::db::is_initialized(path) {
         anyhow::bail!("CodeGraph not initialized");
@@ -684,14 +752,45 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
     let db_path = get_database_path(path);
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
     let queries = QueryBuilder::new(db.get_conn());
-    let traverser = GraphTraverser { queries };
 
-    let callees = traverser.get_callees(symbol, 1).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Search for symbol first
+    let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
+    let results = queries.search_nodes(symbol, Some(&options))?;
+
+    // Filter to exact name matches
+    let exact_matches: Vec<_> = results.iter().filter(|r| {
+        r.node.name == symbol || r.node.qualified_name.ends_with(&format!("::{}", symbol))
+    }).collect();
+
+    let matches: Vec<_> = if exact_matches.is_empty() {
+        results.iter().take(1).collect()
+    } else {
+        exact_matches
+    };
+
+    if matches.is_empty() {
+        println!("No matching symbols found for '{}'", symbol);
+        return Ok(());
+    }
+
+    // Get callees with deduplication
+    let traverser = GraphTraverser { queries };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all_callees: Vec<(codegraph::types::Node, codegraph::types::Edge)> = Vec::new();
+
+    for result in &matches {
+        let callees = traverser.get_callees(&result.node.id, 1).map_err(|e| anyhow::anyhow!("{}", e))?;
+        for (node, edge) in callees {
+            if seen.insert(node.id.clone()) {
+                all_callees.push((node, edge));
+            }
+        }
+    }
 
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
-            "callees": callees.iter().take(limit).map(|(node, edge)| {
+            "callees": all_callees.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
                     "file": node.file_path,
@@ -700,15 +799,15 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
                     "edge_kind": edge.kind.as_str(),
                 })
             }).collect::<Vec<_>>(),
-            "total": callees.len(),
+            "total": all_callees.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        if callees.is_empty() {
+        if all_callees.is_empty() {
             println!("No callees found for '{}'", symbol);
         } else {
-            println!("Callees of '{}' ({}):", symbol, callees.len());
-            for (node, edge) in callees.iter().take(limit) {
+            println!("Callees of '{}' ({}):", symbol, all_callees.len());
+            for (node, _) in all_callees.iter().take(limit) {
                 println!("  - {} ({}) at {}:{}", node.name, node.kind.as_str(), node.file_path, node.start_line);
             }
         }
@@ -720,6 +819,9 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
 fn cmd_impact(path: &str, symbol: &str, depth: usize, json: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
     use codegraph::core::query::GraphTraverser;
+
+    // Clamp depth to 1-10 range (matching TS behavior)
+    let depth = depth.max(1).min(10);
 
     if !codegraph::db::is_initialized(path) {
         anyhow::bail!("CodeGraph not initialized");
@@ -774,8 +876,12 @@ fn cmd_uninit(path: &str, force: bool) -> anyhow::Result<()> {
     }
 
     if !force {
-        println!("This will remove all CodeGraph data in {}", path);
-        println!("Use --force to skip this confirmation");
+        eprintln!(
+            "⚠ This will permanently remove the .codegraph/ directory in '{}'\n\
+             \x20  including the database and all indexed data.\n\
+             \x20  Run 'codegraph uninit --force' to confirm.",
+            path
+        );
         return Ok(());
     }
 
@@ -828,107 +934,195 @@ fn cmd_files(
     json: bool,
     no_metadata: bool,
 ) -> anyhow::Result<()> {
-    use std::path::Path;
-    use ignore::WalkBuilder;
+    use std::collections::BTreeMap;
     use globset::Glob;
 
-    let root = Path::new(path);
-    if !root.exists() {
-        anyhow::bail!("Path does not exist: {}", path);
+    if !codegraph::db::is_initialized(path) {
+        anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
     }
 
-    let mut walker = WalkBuilder::new(root);
-    walker.hidden(false);
+    let db_path = codegraph::db::get_database_path(path);
+    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let queries = QueryBuilder::new(db.get_conn());
 
-    if let Some(depth) = max_depth {
-        walker.max_depth(Some(depth));
-    }
+    // Get files from database
+    let all_files = queries.get_all_files()?;
 
-    let glob_matcher = if let Some(pat) = pattern {
+    // Apply filters
+    let pattern_matcher = if let Some(pat) = pattern {
         Some(Glob::new(pat)?.compile_matcher())
     } else {
         None
     };
 
-    let filter_dir = filter.map(|f| root.join(f));
-
-    let mut files: Vec<String> = Vec::new();
-
-    for entry in walker.build() {
-        let entry = entry?;
-        let entry_path = entry.path();
-
+    let mut files: Vec<&codegraph::types::FileRecord> = all_files.iter().filter(|f| {
         // Apply directory filter
-        if let Some(ref filter_path) = filter_dir {
-            if !entry_path.starts_with(filter_path) {
-                continue;
+        if let Some(filter_dir) = filter {
+            if !f.path.starts_with(filter_dir) {
+                return false;
             }
         }
+        // Apply pattern filter
+        if let Some(ref glob) = pattern_matcher {
+            let file_name = std::path::Path::new(&f.path).file_name().unwrap_or_default();
+            if !glob.is_match(file_name) {
+                return false;
+            }
+        }
+        true
+    }).collect();
 
-        // Apply glob pattern
-        if let Some(ref glob) = glob_matcher {
-            if !glob.is_match(entry_path.file_name().unwrap_or_default()) {
-                continue;
-            }
-        }
-
-        if entry_path.is_file() {
-            if let Ok(rel) = entry_path.strip_prefix(root) {
-                files.push(rel.to_string_lossy().to_string());
-            }
-        }
-    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
 
     if json {
+        let files_json: Vec<_> = files.iter().map(|f| {
+            let mut obj = serde_json::json!({
+                "path": f.path,
+            });
+            if !no_metadata {
+                obj["language"] = serde_json::json!(f.language.as_str());
+                obj["node_count"] = serde_json::json!(f.node_count);
+                obj["size"] = serde_json::json!(f.size);
+            }
+            obj
+        }).collect();
         let output = serde_json::json!({
             "root": path,
-            "files": files,
+            "files": files_json,
             "count": files.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        match format {
-            "flat" => {
-                for file in &files {
-                    println!("{}", file);
-                }
-            }
-            "grouped" => {
-                let mut by_ext: std::collections::BTreeMap<String, Vec<&String>> = std::collections::BTreeMap::new();
-                for file in &files {
-                    let ext = Path::new(file)
-                        .extension()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    by_ext.entry(ext).or_default().push(file);
-                }
-                for (ext, ext_files) in &by_ext {
-                    println!(".{} ({} files):", ext, ext_files.len());
-                    for file in ext_files {
-                        println!("  {}", file);
-                    }
-                }
-            }
-            _ => {
-                // tree format (default)
-                println!("{}/", path);
-                for file in &files {
-                    let depth = file.matches('/').count();
-                    let indent = "  ".repeat(depth);
-                    let name = Path::new(file).file_name().unwrap_or_default().to_string_lossy();
-                    println!("{}{}", indent, name);
+        return Ok(());
+    }
+
+    match format {
+        "flat" => {
+            for f in &files {
+                if no_metadata {
+                    println!("{}", f.path);
+                } else {
+                    println!("{} ({}, {} symbols)", f.path, f.language.as_str(), f.node_count);
                 }
             }
         }
-        println!("\n{} files", files.len());
+        "grouped" => {
+            let mut by_lang: BTreeMap<String, Vec<&codegraph::types::FileRecord>> = BTreeMap::new();
+            for f in &files {
+                by_lang.entry(f.language.as_str().to_string()).or_default().push(f);
+            }
+            for (lang, lang_files) in &by_lang {
+                println!("{} ({} files):", lang, lang_files.len());
+                for f in lang_files {
+                    if no_metadata {
+                        println!("  {}", f.path);
+                    } else {
+                        println!("  {} ({} symbols)", f.path, f.node_count);
+                    }
+                }
+            }
+        }
+        _ => {
+            // Tree format: build directory tree from file paths
+            println!("{}", path);
+            build_file_tree(&files, max_depth, no_metadata, 1);
+        }
     }
 
+    println!("\n{} files", files.len());
     Ok(())
+}
+
+/// Build and print a directory tree from file records
+fn build_file_tree(
+    files: &[&codegraph::types::FileRecord],
+    max_depth: Option<usize>,
+    no_metadata: bool,
+    current_depth: usize,
+) {
+    use std::collections::BTreeMap;
+
+    // Group files by their top-level directory component
+    let mut groups: BTreeMap<String, Vec<&codegraph::types::FileRecord>> = BTreeMap::new();
+
+    for &f in files {
+        let parts: Vec<&str> = f.path.split('/').collect();
+        if parts.is_empty() { continue; }
+
+        let key = if parts.len() == 1 {
+            // File in root
+            String::new()
+        } else {
+            parts[0].to_string()
+        };
+        groups.entry(key).or_default().push(f);
+    }
+
+    // Sort entries: directories first, then files
+    let mut entries: Vec<(&String, &Vec<&codegraph::types::FileRecord>)> = groups.iter().collect();
+    entries.sort_by(|(a, _), (b, _)| {
+        let a_is_dir = !a.is_empty();
+        let b_is_dir = !b.is_empty();
+        b_is_dir.cmp(&a_is_dir).then(a.cmp(b))
+    });
+
+    let depth_reached = max_depth.map(|d| current_depth >= d).unwrap_or(false);
+
+    for (i, (dir_name, dir_files)) in entries.iter().enumerate() {
+        let is_last = i == entries.len() - 1;
+        let prefix = if is_last { "└── " } else { "├── " };
+        let indent = if is_last { "    " } else { "│   " };
+
+        if dir_name.is_empty() {
+            // Root-level files
+            for (j, &f) in dir_files.iter().enumerate() {
+                let file_last = j == dir_files.len() - 1 && is_last;
+                let file_prefix = if file_last { "└── " } else { "├── " };
+                if no_metadata {
+                    let name = std::path::Path::new(&f.path).file_name().unwrap_or_default().to_string_lossy();
+                    println!("{}{}", file_prefix, name);
+                } else {
+                    let name = std::path::Path::new(&f.path).file_name().unwrap_or_default().to_string_lossy();
+                    println!("{}{} ({}, {} symbols)", file_prefix, name, f.language.as_str(), f.node_count);
+                }
+            }
+        } else {
+            // Directory
+            println!("{}{}/", prefix, dir_name);
+
+            if !depth_reached {
+                // Recurse: strip directory prefix from file paths
+                let _sub_files: Vec<&codegraph::types::FileRecord> = dir_files.iter().map(|&f| f).collect();
+                // Create copies with directory prefix stripped
+                // For simplicity, use the file path as-is and adjust indentation
+                for (j, &f) in dir_files.iter().enumerate() {
+                    let file_last = j == dir_files.len() - 1;
+                    let line_prefix = if file_last { "└── " } else { "├── " };
+                    let _full_indent = if is_last { "    " } else { "│   " };
+                    let name = std::path::Path::new(&f.path).file_name().unwrap_or_default().to_string_lossy();
+                    if f.path.contains('/') {
+                        if no_metadata {
+                            println!("{}{}{}", indent, line_prefix, &f.path[dir_name.len()+1..]);
+                        } else {
+                            println!("{}{}{} ({}, {} symbols)", indent, line_prefix,
+                                &f.path[dir_name.len()+1..], f.language.as_str(), f.node_count);
+                        }
+                    } else {
+                        if no_metadata {
+                            println!("{}{}{}", indent, line_prefix, name);
+                        } else {
+                            println!("{}{}{} ({}, {} symbols)", indent, line_prefix,
+                                name, f.language.as_str(), f.node_count);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn cmd_explore(path: &str, query: &[String], max_files: usize) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
+    use codegraph::core::query::GraphTraverser;
     use std::fs;
 
     if !codegraph::db::is_initialized(path) {
@@ -950,6 +1144,8 @@ fn cmd_explore(path: &str, query: &[String], max_files: usize) -> anyhow::Result
 
     println!("Exploring '{}':\n", search_query);
 
+    let traverser = GraphTraverser { queries };
+
     let mut files_shown = 0;
 
     for result in results.iter() {
@@ -960,6 +1156,24 @@ fn cmd_explore(path: &str, query: &[String], max_files: usize) -> anyhow::Result
         let node = &result.node;
         println!("=== {} ({}) ===", node.name, node.kind.as_str());
         println!("  File: {}:{}", node.file_path, node.start_line);
+
+        // Show callers and callees
+        if let Ok(callers) = traverser.get_callers(&node.id, 1) {
+            if !callers.is_empty() {
+                println!("  Called by:");
+                for (caller, _) in callers.iter().take(5) {
+                    println!("    - {} ({}) at {}:{}", caller.name, caller.kind.as_str(), caller.file_path, caller.start_line);
+                }
+            }
+        }
+        if let Ok(callees) = traverser.get_callees(&node.id, 1) {
+            if !callees.is_empty() {
+                println!("  Calls:");
+                for (callee, _) in callees.iter().take(5) {
+                    println!("    - {} ({}) at {}:{}", callee.name, callee.kind.as_str(), callee.file_path, callee.start_line);
+                }
+            }
+        }
 
         // Try to read source
         let full_path = std::path::Path::new(path).join(&node.file_path);
@@ -1073,8 +1287,9 @@ fn cmd_affected(
     quiet: bool,
 ) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
-    use codegraph::core::query::GraphTraverser;
+    use std::collections::{HashSet, VecDeque};
     use std::io::{self, BufRead};
+    use globset::Glob;
 
     if !codegraph::db::is_initialized(path) {
         anyhow::bail!("CodeGraph not initialized");
@@ -1083,8 +1298,6 @@ fn cmd_affected(
     let db_path = get_database_path(path);
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
     let queries = QueryBuilder::new(db.get_conn());
-    let traverser_queries = QueryBuilder::new(db.get_conn());
-    let traverser = GraphTraverser { queries: traverser_queries };
 
     // Collect files to analyze
     let mut changed_files: Vec<String> = files.to_vec();
@@ -1103,38 +1316,68 @@ fn cmd_affected(
         anyhow::bail!("No files specified. Provide files as arguments or use --stdin");
     }
 
-    // Find symbols in changed files and their impact
-    let mut affected: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for file in &changed_files {
-        let options = codegraph::types::SearchOptions {
-            file_pattern: Some(file.clone()),
-            ..Default::default()
-        };
-        let results = queries.search_nodes("", Some(&options))?;
-
-        for result in &results {
-            let impact = traverser.get_impact_radius(&result.node.name, depth).map_err(|e| anyhow::anyhow!("{}", e))?;
-            for node in impact.nodes.values() {
-                // Apply test file filter
-                if let Some(filter_glob) = filter {
-                    let glob = globset::Glob::new(filter_glob)?.compile_matcher();
-                    if !glob.is_match(&node.file_path) {
-                        continue;
-                    }
+    // Build test file matcher
+    let default_test_patterns = [
+        ".spec.", ".test.", "/__tests__/", "/tests?/", "/e2e/", "/spec/"
+    ];
+    let is_test_file = |file_path: &str| -> bool {
+        if let Some(filter_glob) = filter {
+            if let Ok(glob) = Glob::new(filter_glob) {
+                if glob.compile_matcher().is_match(file_path) {
+                    return true;
                 }
-                affected.insert(node.file_path.clone());
+            }
+        }
+        default_test_patterns.iter().any(|pat| file_path.contains(pat))
+    };
+
+    // BFS on file-level dependency graph
+    let mut affected: HashSet<String> = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+    // Seed BFS with changed files
+    for file in &changed_files {
+        let rel = file.clone();
+        if is_test_file(&rel) {
+            affected.insert(rel.clone());
+        }
+        if visited.insert(rel.clone()) {
+            queue.push_back((rel, 0));
+        }
+    }
+
+    // BFS traversal
+    while let Some((current_file, current_depth)) = queue.pop_front() {
+        if current_depth >= depth {
+            continue;
+        }
+
+        if let Ok(dependents) = queries.get_file_dependents(&current_file) {
+            for dep_file in dependents {
+                if !visited.insert(dep_file.clone()) {
+                    continue;
+                }
+                if is_test_file(&dep_file) {
+                    affected.insert(dep_file.clone());
+                }
+                queue.push_back((dep_file, current_depth + 1));
             }
         }
     }
 
-    let affected_files: Vec<&String> = affected.iter().collect();
+    let mut affected_files: Vec<String> = affected.into_iter().collect();
+    affected_files.sort();
+    let total_affected = affected_files.len();
+    let _affected_refs: Vec<&String> = affected_files.iter().collect();
+    // For JSON output
+    let _affected_slice = affected_files.clone();
 
     if json {
         let output = serde_json::json!({
             "changed": changed_files,
             "affected": affected_files,
-            "count": affected_files.len(),
+            "count": total_affected,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if quiet {
@@ -1143,7 +1386,7 @@ fn cmd_affected(
         }
     } else {
         println!("Changed files: {}", changed_files.len());
-        println!("Affected files: {}", affected_files.len());
+        println!("Affected files: {}", total_affected);
         for file in &affected_files {
             println!("  {}", file);
         }
@@ -1184,7 +1427,7 @@ fn cmd_uninstall(
 fn cmd_upgrade(
     version: Option<&str>,
     check: bool,
-    force: bool,
+    _force: bool,
 ) -> anyhow::Result<()> {
     println!("CodeGraph v{}", env!("CARGO_PKG_VERSION"));
 

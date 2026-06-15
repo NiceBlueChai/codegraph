@@ -759,6 +759,52 @@ impl<'a> QueryBuilder<'a> {
         ")?;
         Ok(())
     }
+
+    /// Get file-level dependents: files that depend on nodes in the given file
+    pub fn get_file_dependents(&self, file_path: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT n2.file_path
+             FROM edges e
+             JOIN nodes n1 ON e.source = n1.id
+             JOIN nodes n2 ON e.target = n2.id
+             WHERE n1.file_path = ?1 AND n1.file_path != n2.file_path"
+        )?;
+        let rows = stmt.query_map(params![file_path], |row| row.get(0))?;
+        rows.collect::<Result<Vec<String>, _>>()
+            .map_err(|e| e.into())
+    }
+
+    /// Get node count by kind
+    pub fn get_nodes_by_kind_counts(&self) -> Result<Vec<(String, u64)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, COUNT(*) as cnt FROM nodes GROUP BY kind ORDER BY cnt DESC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Get distinct languages used in the project
+    pub fn get_languages(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT language FROM files ORDER BY language"
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<String>, _>>()
+            .map_err(|e| e.into())
+    }
+
+    /// Get file count by language
+    pub fn get_file_counts_by_language(&self) -> Result<Vec<(String, u64)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT language, COUNT(*) as cnt FROM files GROUP BY language ORDER BY cnt DESC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        rows.collect()
+    }
 }
 
 /// Escape FTS5 special characters
