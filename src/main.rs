@@ -1236,13 +1236,16 @@ fn cmd_install(
     no_permissions: bool,
     print_config: Option<&str>,
 ) -> anyhow::Result<()> {
-    println!("Install command - Agent installation not yet implemented");
-    println!("  Target: {:?}", target);
-    println!("  Location: {:?}", location);
-    println!("  Yes: {}", yes);
-    println!("  No permissions: {}", no_permissions);
-    println!("  Print config: {:?}", print_config);
-    println!("\nFor now, manually add MCP server config to your AI agent.");
+    let location = codegraph::installer::Location::parse(location)?;
+    if let Some(target) = print_config {
+        print!("{}", codegraph::installer::print_config(target, location)?);
+        return Ok(());
+    }
+
+    let auto_allow = if no_permissions { false } else { yes };
+    for report in codegraph::installer::install(target, location, auto_allow)? {
+        println!("{}", report);
+    }
     Ok(())
 }
 
@@ -1251,10 +1254,13 @@ fn cmd_uninstall(
     location: Option<&str>,
     yes: bool,
 ) -> anyhow::Result<()> {
-    println!("Uninstall command - Agent uninstallation not yet implemented");
-    println!("  Target: {:?}", target);
-    println!("  Location: {:?}", location);
-    println!("  Yes: {}", yes);
+    let location = codegraph::installer::Location::parse(location)?;
+    if !yes && target.is_none() && location == codegraph::installer::Location::Global {
+        println!("Uninstalling all global CodeGraph agent entries.");
+    }
+    for report in codegraph::installer::uninstall(target, location)? {
+        println!("{}", report);
+    }
     Ok(())
 }
 

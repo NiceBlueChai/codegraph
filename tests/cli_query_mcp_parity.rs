@@ -42,6 +42,15 @@ fn run_codegraph_with_input(args: &[&str], cwd: &Path, input: &str) -> Output {
     child.wait_with_output().expect("wait for codegraph")
 }
 
+fn run_codegraph_with_env(args: &[&str], cwd: &Path, envs: &[(&str, &Path)]) -> Output {
+    let mut command = Command::new(codegraph_bin());
+    command.args(args).current_dir(cwd);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("codegraph command should launch")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
 }
@@ -879,5 +888,91 @@ fn affected_resolves_project_from_subdirectory() {
     assert_eq!(
         value["affectedTests"],
         serde_json::json!(["tests/lib.test.ts"])
+    );
+}
+
+#[test]
+fn install_print_config_codex_writes_no_files() {
+    let dir = tempfile::tempdir().expect("temp install project");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+
+    let output = run_codegraph_with_env(
+        &["install", "--print-config", "codex", "--location", "global"],
+        dir.path(),
+        &[("HOME", &home), ("USERPROFILE", &home)],
+    );
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(
+        out.contains("[mcp_servers.codegraph]"),
+        "expected codex toml config:\n{out}"
+    );
+    assert!(
+        out.contains("command = \"codegraph\""),
+        "expected codegraph command:\n{out}"
+    );
+    assert!(
+        !home.join(".codex").join("config.toml").exists(),
+        "print-config must not write config files"
+    );
+}
+
+#[test]
+fn install_and_uninstall_cursor_local_updates_mcp_json() {
+    let dir = tempfile::tempdir().expect("temp install project");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+
+    let install = run_codegraph_with_env(
+        &[
+            "install",
+            "--target",
+            "cursor",
+            "--location",
+            "local",
+            "--yes",
+        ],
+        dir.path(),
+        &[("HOME", &home), ("USERPROFILE", &home)],
+    );
+    assert!(install.status.success(), "stderr:\n{}", stderr(&install));
+
+    let mcp_path = dir.path().join(".cursor").join("mcp.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&mcp_path).expect("cursor mcp config"))
+            .expect("cursor config json");
+    let server = &config["mcpServers"]["codegraph"];
+    assert_eq!(server["type"], "stdio");
+    assert_eq!(server["command"], "codegraph");
+    assert!(
+        server["args"]
+            .as_array()
+            .expect("args array")
+            .iter()
+            .any(|arg| arg == "--path"),
+        "cursor local config should include --path:\n{config}"
+    );
+
+    let uninstall = run_codegraph_with_env(
+        &[
+            "uninstall",
+            "--target",
+            "cursor",
+            "--location",
+            "local",
+            "--yes",
+        ],
+        dir.path(),
+        &[("HOME", &home), ("USERPROFILE", &home)],
+    );
+    assert!(uninstall.status.success(), "stderr:\n{}", stderr(&uninstall));
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&mcp_path).expect("cursor mcp config"))
+            .expect("cursor config json");
+    assert!(
+        config["mcpServers"].get("codegraph").is_none(),
+        "uninstall should remove codegraph entry:\n{config}"
     );
 }
