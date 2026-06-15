@@ -382,6 +382,20 @@ fn callers_text_limit_does_not_change_header_total() {
 }
 
 #[test]
+fn impact_json_includes_edge_count() {
+    let dir = fixture_project_with_two_helper_callers();
+    let output = run_codegraph(&["impact", "helper", "--json"], dir.path());
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("impact stdout is json");
+
+    assert!(
+        value["edgeCount"].as_u64().is_some(),
+        "expected numeric edgeCount:\n{value}"
+    );
+}
+
+#[test]
 fn query_kind_filter_is_applied_before_limit() {
     let dir = many_matching_functions_then_class_project();
     let output = run_codegraph(

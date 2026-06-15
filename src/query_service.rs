@@ -57,6 +57,15 @@ pub struct FileListingEntry {
     pub size: Option<u64>,
 }
 
+/// Shared impact analysis summary for CLI and MCP parity.
+#[derive(Debug, Serialize)]
+pub struct ImpactSummary {
+    /// Nodes affected by changes to the queried symbol.
+    pub affected: Vec<Node>,
+    /// Number of deduplicated graph edges in the impact radius.
+    pub edge_count: usize,
+}
+
 /// Shared query facade used by CLI commands and MCP handlers.
 pub struct QueryService<'a> {
     /// Resolved project context for path-sensitive operations.
@@ -381,16 +390,29 @@ impl<'a> QueryService<'a> {
 
     /// Finds nodes affected by changes to matching symbols.
     pub fn impact_nodes(&self, symbol: &str, depth: usize) -> anyhow::Result<Vec<Node>> {
+        Ok(self.impact_summary(symbol, depth)?.affected)
+    }
+
+    /// Finds nodes and edge count affected by changes to matching symbols.
+    pub fn impact_summary(&self, symbol: &str, depth: usize) -> anyhow::Result<ImpactSummary> {
         let depth = depth.max(1).min(10);
         let matches = self.exact_symbol_matches(symbol, 50)?;
         let match_ids: HashSet<String> = matches.iter().map(|node| node.id.clone()).collect();
         let traverser = GraphTraverser::new(QueryBuilder::new(self.queries.get_conn()));
         let mut seen = HashSet::new();
+        let mut edge_seen = HashSet::new();
         let mut out = Vec::new();
         for node in matches {
             let impact = traverser
                 .get_impact_radius(&node.id, depth)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+            for edge in impact.edges {
+                edge_seen.insert((
+                    edge.source,
+                    edge.target,
+                    edge.kind.as_str().to_string(),
+                ));
+            }
             for (_, affected) in impact.nodes {
                 if !match_ids.contains(&affected.id) && seen.insert(affected.id.clone()) {
                     out.push(affected);
@@ -405,7 +427,10 @@ impl<'a> QueryService<'a> {
                 .then(a.id.cmp(&b.id))
                 .then(a.kind.as_str().cmp(b.kind.as_str()))
         });
-        Ok(out)
+        Ok(ImpactSummary {
+            affected: out,
+            edge_count: edge_seen.len(),
+        })
     }
 
     /// Renders visible graph relationship rows with the full unbounded total.

@@ -747,13 +747,16 @@ fn cmd_impact(path: &str, symbol: &str, depth: usize, json: bool) -> anyhow::Res
     let db = project.open_database()?;
     let service =
         codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
-    let affected_nodes = service.impact_nodes(symbol, depth)?;
+    let summary = service.impact_summary(symbol, depth)?;
+    let edge_count = summary.edge_count;
+    let affected_nodes = summary.affected;
 
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
             "depth": depth,
             "nodeCount": affected_nodes.len(),
+            "edgeCount": edge_count,
             "affected": affected_nodes.iter().map(|node| {
                 serde_json::json!({
                     "name": node.name,
