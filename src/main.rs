@@ -643,7 +643,9 @@ fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()
             Ok(project) => project,
             Err(_) => {
                 let mut server = codegraph::mcp::server::MCPServer::new();
-                server.run().map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+                server
+                    .run()
+                    .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
                 return Ok(());
             }
         };
@@ -653,7 +655,9 @@ fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()
         let mut server = codegraph::mcp::server::MCPServer::new()
             .with_project(project)
             .with_queries(queries);
-        server.run().map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+        server
+            .run()
+            .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
     } else {
         println!("Starting MCP server...");
         println!("Use --mcp flag to start in MCP mode");

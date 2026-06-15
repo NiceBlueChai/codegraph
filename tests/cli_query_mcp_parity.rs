@@ -694,3 +694,30 @@ fn mcp_non_default_tool_is_disabled_without_allowlist() {
         mcp_text(&result)
     );
 }
+
+#[test]
+fn mcp_missing_required_arguments_return_tool_error() {
+    let _guard = mcp_tools_env(None);
+    let dir = fixture_project();
+    let project = codegraph::project::resolve_project(Some(
+        dir.path().to_str().expect("temp path is utf-8"),
+    ))
+    .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let result = codegraph::mcp::tools::execute_tool(
+        "codegraph_search",
+        Some(serde_json::json!({})),
+        &project,
+        &queries,
+    )
+    .expect("missing argument should be a tool-level error");
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        mcp_text(&result).contains("Missing required argument `query`"),
+        "unexpected missing argument message:\n{}",
+        mcp_text(&result)
+    );
+}

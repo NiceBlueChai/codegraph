@@ -373,7 +373,10 @@ fn handle_explore(
     service: &QueryService<'_>,
     args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let query = required_string(args, "query")?;
+    let query = match required_string(args, "query") {
+        Ok(query) => query,
+        Err(error) => return text_error(error),
+    };
     let max_files = args["maxFiles"].as_u64().unwrap_or(5) as usize;
 
     text(service.render_explore_text(query, max_files)?)
@@ -414,7 +417,10 @@ fn handle_search(
     service: &QueryService<'_>,
     args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let query = required_string(args, "query")?;
+    let query = match required_string(args, "query") {
+        Ok(query) => query,
+        Err(error) => return text_error(error),
+    };
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
     let kind = args["kind"].as_str();
     let results = service.search(query, limit, kind)?;
@@ -437,7 +443,10 @@ fn handle_callers(
     service: &QueryService<'_>,
     args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let symbol = required_string(args, "symbol")?;
+    let symbol = match required_string(args, "symbol") {
+        Ok(symbol) => symbol,
+        Err(error) => return text_error(error),
+    };
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
     let callers = service.callers(symbol, limit)?;
     let visible = callers.iter().take(limit).cloned().collect::<Vec<_>>();
@@ -453,7 +462,10 @@ fn handle_callees(
     service: &QueryService<'_>,
     args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let symbol = required_string(args, "symbol")?;
+    let symbol = match required_string(args, "symbol") {
+        Ok(symbol) => symbol,
+        Err(error) => return text_error(error),
+    };
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
     let callees = service.callees(symbol, limit)?;
     let visible = callees.iter().take(limit).cloned().collect::<Vec<_>>();
@@ -469,7 +481,10 @@ fn handle_impact(
     service: &QueryService<'_>,
     args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let symbol = required_string(args, "symbol")?;
+    let symbol = match required_string(args, "symbol") {
+        Ok(symbol) => symbol,
+        Err(error) => return text_error(error),
+    };
     let depth = args["depth"].as_u64().unwrap_or(3) as usize;
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
     let impact = service.impact_summary(symbol, depth)?;
@@ -536,11 +551,11 @@ fn text_error(text: String) -> Result<CallToolResult, Box<dyn std::error::Error>
     })
 }
 
-fn required_string<'a>(args: &'a Value, name: &str) -> Result<&'a str, Box<dyn std::error::Error>> {
+fn required_string<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     args[name]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("Missing required argument `{}`", name).into())
+        .ok_or_else(|| format!("Missing required argument `{}`", name))
 }
 
 fn is_known_tool_name(name: &str) -> bool {
