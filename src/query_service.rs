@@ -271,7 +271,7 @@ impl<'a> QueryService<'a> {
                     }
                 }
                 Err(error) => {
-                    out.push_str(&format!("  Warning: failed to load callers: {}\n", error));
+                    out.push_str(&relationship_warning("callers", &error));
                 }
             }
 
@@ -291,7 +291,7 @@ impl<'a> QueryService<'a> {
                     }
                 }
                 Err(error) => {
-                    out.push_str(&format!("  Warning: failed to load callees: {}\n", error));
+                    out.push_str(&relationship_warning("callees", &error));
                 }
             }
         }
@@ -422,6 +422,10 @@ fn parse_node_kinds(kind: Option<&str>) -> Option<Vec<NodeKind>> {
     })
 }
 
+fn relationship_warning(kind: &str, error: &dyn std::fmt::Display) -> String {
+    format!("  Warning: failed to load {}: {}\n", kind, error)
+}
+
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
@@ -437,4 +441,18 @@ fn source_window_len(node: &Node) -> usize {
     let start = node.start_line as usize;
     let end = node.end_line.max(node.start_line) as usize;
     end.saturating_sub(start) + 3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relationship_warning;
+
+    #[test]
+    fn relationship_warning_mentions_callers_and_callees() {
+        let callers = relationship_warning("callers", &"broken traversal");
+        let callees = relationship_warning("callees", &"broken traversal");
+
+        assert!(callers.contains("failed to load callers"));
+        assert!(callees.contains("failed to load callees"));
+    }
 }
