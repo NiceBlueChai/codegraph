@@ -6,7 +6,8 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use tempfile::TempDir;
@@ -21,6 +22,24 @@ fn run_codegraph(args: &[&str], cwd: &Path) -> Output {
         .current_dir(cwd)
         .output()
         .expect("codegraph command should launch")
+}
+
+fn run_codegraph_with_input(args: &[&str], cwd: &Path, input: &str) -> Output {
+    let mut child = Command::new(codegraph_bin())
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("codegraph command should launch");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for codegraph")
 }
 
 fn stdout(output: &Output) -> String {
@@ -199,6 +218,95 @@ fn many_matching_functions_then_class_project() -> TempDir {
         20,
     );
     queries.insert_node(&node).expect("insert class node");
+    dir
+}
+
+fn affected_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("src")).expect("create src");
+    fs::create_dir_all(dir.path().join("tests")).expect("create tests");
+    fs::write(dir.path().join("src").join("lib.ts"), "export const lib = 1;\n")
+        .expect("write lib");
+    fs::write(
+        dir.path().join("src").join("app.ts"),
+        "import { lib } from './lib';\nexport const app = lib;\n",
+    )
+    .expect("write app");
+    fs::write(
+        dir.path().join("tests").join("lib.test.ts"),
+        "import { app } from '../src/app';\n",
+    )
+    .expect("write test");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+
+    let project = codegraph::project::resolve_project(Some(
+        dir.path().to_str().expect("temp path is utf-8"),
+    ))
+    .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let lib = codegraph::types::Node::new(
+        "src/lib.ts::lib".to_string(),
+        codegraph::types::NodeKind::Variable,
+        "lib".to_string(),
+        "src/lib.ts::lib".to_string(),
+        "src/lib.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        1,
+        1,
+        1,
+        20,
+    );
+    let app = codegraph::types::Node::new(
+        "src/app.ts::app".to_string(),
+        codegraph::types::NodeKind::Variable,
+        "app".to_string(),
+        "src/app.ts::app".to_string(),
+        "src/app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        2,
+        2,
+        1,
+        20,
+    );
+    let test = codegraph::types::Node::new(
+        "tests/lib.test.ts::test".to_string(),
+        codegraph::types::NodeKind::Function,
+        "test".to_string(),
+        "tests/lib.test.ts::test".to_string(),
+        "tests/lib.test.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        1,
+        1,
+        1,
+        20,
+    );
+    for node in [&lib, &app, &test] {
+        queries.insert_node(node).expect("insert affected node");
+    }
+    queries
+        .insert_edge(&codegraph::types::Edge::new(
+            app.id.clone(),
+            lib.id.clone(),
+            codegraph::types::EdgeKind::Imports,
+        ))
+        .expect("insert app dependency");
+    queries
+        .insert_edge(&codegraph::types::Edge::new(
+            test.id.clone(),
+            app.id.clone(),
+            codegraph::types::EdgeKind::Imports,
+        ))
+        .expect("insert test dependency");
+
     dir
 }
 
@@ -719,5 +827,57 @@ fn mcp_missing_required_arguments_return_tool_error() {
         mcp_text(&result).contains("Missing required argument `query`"),
         "unexpected missing argument message:\n{}",
         mcp_text(&result)
+    );
+}
+
+#[test]
+fn affected_json_matches_typescript_shape_from_stdin() {
+    let dir = affected_project();
+    let output = run_codegraph_with_input(
+        &["affected", "--stdin", "--json", "--depth", "5"],
+        dir.path(),
+        "src/lib.ts\n",
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(value["changedFiles"], serde_json::json!(["src/lib.ts"]));
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["tests/lib.test.ts"])
+    );
+    assert_eq!(value["totalDependentsTraversed"], 2);
+    assert!(value.get("changed").is_none(), "old key should be absent:\n{value}");
+}
+
+#[test]
+fn affected_empty_stdin_quiet_exits_zero_without_output() {
+    let dir = affected_project();
+    let output = run_codegraph_with_input(&["affected", "--stdin", "--quiet"], dir.path(), "");
+
+    assert!(
+        output.status.success(),
+        "empty stdin should be script-friendly\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output), "");
+}
+
+#[test]
+fn affected_resolves_project_from_subdirectory() {
+    let dir = affected_project();
+    let src = dir.path().join("src");
+    let output = run_codegraph(
+        &["affected", "src/lib.ts", "--json", "--depth", "5"],
+        &src,
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["tests/lib.test.ts"])
     );
 }

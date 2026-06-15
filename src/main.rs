@@ -1106,17 +1106,12 @@ fn cmd_affected(
     json: bool,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
+    use globset::Glob;
     use std::collections::{HashSet, VecDeque};
     use std::io::{self, BufRead};
-    use globset::Glob;
 
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
     let queries = QueryBuilder::new(db.get_conn());
 
     // Collect files to analyze
@@ -1133,81 +1128,100 @@ fn cmd_affected(
     }
 
     if changed_files.is_empty() {
-        anyhow::bail!("No files specified. Provide files as arguments or use --stdin");
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "changedFiles": [],
+                    "affectedTests": [],
+                    "totalDependentsTraversed": 0,
+                }))?
+            );
+        } else if !quiet {
+            println!("No files provided. Use file arguments or --stdin.");
+        }
+        return Ok(());
     }
 
     // Build test file matcher
     let default_test_patterns = [
-        ".spec.", ".test.", "/__tests__/", "/tests?/", "/e2e/", "/spec/"
+        ".spec.",
+        ".test.",
+        "/__tests__/",
+        "/test/",
+        "/tests/",
+        "/e2e/",
+        "/spec/",
     ];
+    let custom_matcher = filter
+        .and_then(|filter_glob| Glob::new(filter_glob).ok())
+        .map(|glob| glob.compile_matcher());
     let is_test_file = |file_path: &str| -> bool {
-        if let Some(filter_glob) = filter {
-            if let Ok(glob) = Glob::new(filter_glob) {
-                if glob.compile_matcher().is_match(file_path) {
-                    return true;
-                }
-            }
+        if let Some(matcher) = &custom_matcher {
+            return matcher.is_match(file_path);
         }
-        default_test_patterns.iter().any(|pat| file_path.contains(pat))
+        let normalized = file_path.replace('\\', "/");
+        default_test_patterns
+            .iter()
+            .any(|pat| normalized.contains(pat))
     };
 
     // BFS on file-level dependency graph
-    let mut affected: HashSet<String> = HashSet::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut affected_tests: HashSet<String> = HashSet::new();
+    let mut all_dependents: HashSet<String> = HashSet::new();
 
-    // Seed BFS with changed files
     for file in &changed_files {
         let rel = file.clone();
         if is_test_file(&rel) {
-            affected.insert(rel.clone());
-        }
-        if visited.insert(rel.clone()) {
-            queue.push_back((rel, 0));
-        }
-    }
-
-    // BFS traversal
-    while let Some((current_file, current_depth)) = queue.pop_front() {
-        if current_depth >= depth {
+            affected_tests.insert(rel);
             continue;
         }
 
-        if let Ok(dependents) = queries.get_file_dependents(&current_file) {
-            for dep_file in dependents {
-                if !visited.insert(dep_file.clone()) {
-                    continue;
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        visited.insert(rel.clone());
+        queue.push_back((rel, 0));
+
+        while let Some((current_file, current_depth)) = queue.pop_front() {
+            if current_depth >= depth {
+                continue;
+            }
+
+            if let Ok(dependents) = queries.get_file_dependents(&current_file) {
+                for dep_file in dependents {
+                    if !visited.insert(dep_file.clone()) {
+                        continue;
+                    }
+                    all_dependents.insert(dep_file.clone());
+                    if is_test_file(&dep_file) {
+                        affected_tests.insert(dep_file);
+                    } else {
+                        queue.push_back((dep_file, current_depth + 1));
+                    }
                 }
-                if is_test_file(&dep_file) {
-                    affected.insert(dep_file.clone());
-                }
-                queue.push_back((dep_file, current_depth + 1));
             }
         }
     }
 
-    let mut affected_files: Vec<String> = affected.into_iter().collect();
-    affected_files.sort();
-    let total_affected = affected_files.len();
-    let _affected_refs: Vec<&String> = affected_files.iter().collect();
-    // For JSON output
-    let _affected_slice = affected_files.clone();
+    let mut affected_tests: Vec<String> = affected_tests.into_iter().collect();
+    affected_tests.sort();
 
     if json {
         let output = serde_json::json!({
-            "changed": changed_files,
-            "affected": affected_files,
-            "count": total_affected,
+            "changedFiles": changed_files,
+            "affectedTests": affected_tests,
+            "totalDependentsTraversed": all_dependents.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if quiet {
-        for file in &affected_files {
+        for file in &affected_tests {
             println!("{}", file);
         }
+    } else if affected_tests.is_empty() {
+        println!("No test files affected by the changed files.");
     } else {
-        println!("Changed files: {}", changed_files.len());
-        println!("Affected files: {}", total_affected);
-        for file in &affected_files {
+        println!("Affected test files ({}):", affected_tests.len());
+        for file in &affected_tests {
             println!("  {}", file);
         }
     }
