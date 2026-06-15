@@ -1011,13 +1011,16 @@ fn cmd_files(
     use std::collections::BTreeMap;
     use globset::Glob;
 
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
-    }
-
-    let db_path = codegraph::db::get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
     let queries = QueryBuilder::new(db.get_conn());
+
+    if json {
+        let service = codegraph::query_service::QueryService::new(project, queries);
+        let output = service.list_files(filter, pattern)?;
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
 
     // Get files from database
     let all_files = queries.get_all_files()?;
@@ -1047,27 +1050,6 @@ fn cmd_files(
     }).collect();
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
-
-    if json {
-        let files_json: Vec<_> = files.iter().map(|f| {
-            let mut obj = serde_json::json!({
-                "path": f.path,
-            });
-            if !no_metadata {
-                obj["language"] = serde_json::json!(f.language.as_str());
-                obj["node_count"] = serde_json::json!(f.node_count);
-                obj["size"] = serde_json::json!(f.size);
-            }
-            obj
-        }).collect();
-        let output = serde_json::json!({
-            "root": path,
-            "files": files_json,
-            "count": files.len(),
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(());
-    }
 
     match format {
         "flat" => {
@@ -1195,77 +1177,13 @@ fn build_file_tree(
 }
 
 fn cmd_explore(path: &str, query: &[String], max_files: usize) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-    use codegraph::core::query::GraphTraverser;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
-
     let search_query = query.join(" ");
-    let options = codegraph::types::SearchOptions::default();
-    let results = queries.search_nodes(&search_query, Some(&options))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
 
-    if results.is_empty() {
-        println!("No results found for '{}'", search_query);
-        return Ok(());
-    }
-
-    println!("Exploring '{}':\n", search_query);
-
-    let traverser = GraphTraverser { queries };
-
-    let mut files_shown = 0;
-
-    for result in results.iter() {
-        if files_shown >= max_files {
-            break;
-        }
-
-        let node = &result.node;
-        println!("=== {} ({}) ===", node.name, node.kind.as_str());
-        println!("  File: {}:{}", node.file_path, node.start_line);
-
-        // Show callers and callees
-        if let Ok(callers) = traverser.get_callers(&node.id, 1) {
-            if !callers.is_empty() {
-                println!("  Called by:");
-                for (caller, _) in callers.iter().take(5) {
-                    println!("    - {} ({}) at {}:{}", caller.name, caller.kind.as_str(), caller.file_path, caller.start_line);
-                }
-            }
-        }
-        if let Ok(callees) = traverser.get_callees(&node.id, 1) {
-            if !callees.is_empty() {
-                println!("  Calls:");
-                for (callee, _) in callees.iter().take(5) {
-                    println!("    - {} ({}) at {}:{}", callee.name, callee.kind.as_str(), callee.file_path, callee.start_line);
-                }
-            }
-        }
-
-        // Try to read source
-        let full_path = std::path::Path::new(path).join(&node.file_path);
-        if let Ok(content) = codegraph::util::read_file_content(&full_path) {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = (node.start_line as usize).saturating_sub(2);
-            let end = (node.end_line as usize + 2).min(lines.len());
-
-            println!("  Source (lines {}-{}):", start + 1, end);
-            for i in start..end {
-                let line_num = i + 1;
-                let marker = if line_num == node.start_line as usize { ">" } else { " " };
-                println!("  {} {:4} | {}", marker, line_num, lines[i]);
-            }
-            files_shown += 1;
-        }
-        println!();
-    }
-
+    print!("{}", service.render_explore_text(&search_query, max_files)?);
     Ok(())
 }
 
@@ -1277,49 +1195,25 @@ fn cmd_node(
     limit: Option<usize>,
     symbols_only: bool,
 ) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-    use std::path::Path;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
 
     // File mode
     if let Some(file_path) = file {
-        let full_path = Path::new(path).join(file_path);
-        let content = codegraph::util::read_file_content(&full_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-
-        let start = offset.unwrap_or(1).saturating_sub(1);
-        let end = limit.map(|l| (start + l).min(lines.len())).unwrap_or(lines.len());
-
         if symbols_only {
-            // Show symbol map for file
-            let options = codegraph::types::SearchOptions {
-                file_pattern: Some(file_path.to_string()),
-                ..Default::default()
-            };
-            let results = queries.search_nodes("", Some(&options))?;
-            println!("Symbols in {}:", file_path);
-            for result in &results {
-                println!("  {} ({}):{}", result.node.name, result.node.kind.as_str(), result.node.start_line);
-            }
+            print!("{}", service.render_symbols_only_text(file_path)?);
         } else {
-            println!("=== {} (lines {}-{}) ===", file_path, start + 1, end);
-            for i in start..end {
-                println!("{:4} | {}", i + 1, lines[i]);
-            }
+            let view = service.file_view(file_path, offset, limit)?;
+            print!("{}", service.render_file_view_text(&view));
         }
         return Ok(());
     }
 
     // Symbol mode
     let options = codegraph::types::SearchOptions::default();
-    let results = queries.search_nodes(name, Some(&options))?;
+    let results = service.queries.search_nodes(name, Some(&options))?;
 
     if results.is_empty() {
         println!("No symbol found: {}", name);
@@ -1334,7 +1228,7 @@ fn cmd_node(
     }
 
     // Read source
-    let full_path = Path::new(path).join(&node.file_path);
+    let full_path = service.project.root.join(&node.file_path);
     if let Ok(content) = codegraph::util::read_file_content(&full_path) {
         let lines: Vec<&str> = content.lines().collect();
         let start = (node.start_line as usize).saturating_sub(1);
