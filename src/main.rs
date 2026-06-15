@@ -697,9 +697,11 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
     let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
     let results = queries.search_nodes(symbol, Some(&options))?;
 
-    // Filter to exact name matches (exact or qualified name with :: suffix)
+    // Filter to exact name matches (exact, :: suffix, or . suffix)
     let exact_matches: Vec<_> = results.iter().filter(|r| {
-        r.node.name == symbol || r.node.qualified_name.ends_with(&format!("::{}", symbol))
+        r.node.name == symbol
+            || r.node.qualified_name.ends_with(&format!("::{}", symbol))
+            || r.node.name.ends_with(&format!(".{}", symbol))
     }).collect();
 
     // Fall back to top match if exact filter removes everything
@@ -734,10 +736,10 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
             "callers": all_callers.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
-                    "file": node.file_path,
-                    "line": node.start_line,
+                    "filePath": node.file_path,
+                    "startLine": node.start_line,
                     "kind": node.kind.as_str(),
-                    "edge_kind": edge.kind.as_str(),
+                    "edgeKind": edge.kind.as_str(),
                 })
             }).collect::<Vec<_>>(),
             "total": all_callers.len(),
@@ -774,9 +776,11 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
     let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
     let results = queries.search_nodes(symbol, Some(&options))?;
 
-    // Filter to exact name matches
+    // Filter to exact name matches (exact, :: suffix, or . suffix)
     let exact_matches: Vec<_> = results.iter().filter(|r| {
-        r.node.name == symbol || r.node.qualified_name.ends_with(&format!("::{}", symbol))
+        r.node.name == symbol
+            || r.node.qualified_name.ends_with(&format!("::{}", symbol))
+            || r.node.name.ends_with(&format!(".{}", symbol))
     }).collect();
 
     let matches: Vec<_> = if exact_matches.is_empty() {
@@ -810,10 +814,10 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
             "callees": all_callees.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
-                    "file": node.file_path,
-                    "line": node.start_line,
+                    "filePath": node.file_path,
+                    "startLine": node.start_line,
                     "kind": node.kind.as_str(),
-                    "edge_kind": edge.kind.as_str(),
+                    "edgeKind": edge.kind.as_str(),
                 })
             }).collect::<Vec<_>>(),
             "total": all_callees.len(),
@@ -836,6 +840,7 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
 fn cmd_impact(path: &str, symbol: &str, depth: usize, json: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
     use codegraph::core::query::GraphTraverser;
+    use std::collections::{HashSet, BTreeMap};
 
     // Clamp depth to 1-10 range (matching TS behavior)
     let depth = depth.max(1).min(10);
@@ -847,33 +852,85 @@ fn cmd_impact(path: &str, symbol: &str, depth: usize, json: bool) -> anyhow::Res
     let db_path = get_database_path(path);
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
     let queries = QueryBuilder::new(db.get_conn());
-    let traverser = GraphTraverser { queries };
 
-    let impact = traverser.get_impact_radius(symbol, depth).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Search for symbol first
+    let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
+    let results = queries.search_nodes(symbol, Some(&options))?;
+
+    // Filter to exact name matches
+    let exact_matches: Vec<_> = results.iter().filter(|r| {
+        r.node.name == symbol
+            || r.node.qualified_name.ends_with(&format!("::{}", symbol))
+            || r.node.name.ends_with(&format!(".{}", symbol))
+    }).collect();
+
+    let matches: Vec<_> = if exact_matches.is_empty() {
+        results.iter().take(1).collect()
+    } else {
+        exact_matches
+    };
+
+    if matches.is_empty() {
+        println!("No matching symbols found for '{}'", symbol);
+        return Ok(());
+    }
+
+    // Merge impact subgraphs from all matching symbols
+    let traverser = GraphTraverser { queries };
+    let mut merged = codegraph::types::Subgraph::new();
+    let mut edge_seen: HashSet<(String, String, String)> = HashSet::new();
+
+    for result in &matches {
+        let impact = traverser.get_impact_radius(&result.node.id, depth)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        for (id, node) in impact.nodes {
+            merged.nodes.entry(id).or_insert(node);
+        }
+        for edge in impact.edges {
+            let key = (edge.source.clone(), edge.target.clone(), edge.kind.as_str().to_string());
+            if edge_seen.insert(key) {
+                merged.edges.push(edge);
+            }
+        }
+    }
+
+    // Collect nodes (exclude the symbol nodes themselves)
+    let match_ids: HashSet<&str> = matches.iter().map(|r| r.node.id.as_str()).collect();
+    let affected_nodes: Vec<&codegraph::types::Node> = merged.nodes.values()
+        .filter(|n| !match_ids.contains(n.id.as_str()))
+        .collect();
 
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
             "depth": depth,
-            "affected": impact.nodes.values().map(|node| {
+            "nodeCount": affected_nodes.len(),
+            "edgeCount": merged.edges.len(),
+            "affected": affected_nodes.iter().map(|node| {
                 serde_json::json!({
                     "name": node.name,
-                    "file": node.file_path,
-                    "line": node.start_line,
+                    "filePath": node.file_path,
+                    "startLine": node.start_line,
                     "kind": node.kind.as_str(),
                 })
             }).collect::<Vec<_>>(),
-            "total": impact.nodes.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        if impact.nodes.is_empty() {
+        if affected_nodes.is_empty() {
             println!("No impact found for '{}'", symbol);
         } else {
-            println!("Impact analysis for '{}' (depth {}):", symbol, depth);
-            println!("  Affected symbols: {}", impact.nodes.len());
-            for node in impact.nodes.values() {
-                println!("  - {} ({}) at {}:{}", node.name, node.kind.as_str(), node.file_path, node.start_line);
+            // Group by file
+            let mut by_file: BTreeMap<&str, Vec<&codegraph::types::Node>> = BTreeMap::new();
+            for node in &affected_nodes {
+                by_file.entry(node.file_path.as_str()).or_default().push(node);
+            }
+            println!("Impact of changing \"{}\" — {} affected symbols:", symbol, affected_nodes.len());
+            for (file, nodes) in &by_file {
+                println!("  {}:", file);
+                for node in nodes {
+                    println!("    {:12} {}", format!("({})", node.kind.as_str()), node.name);
+                }
             }
         }
     }

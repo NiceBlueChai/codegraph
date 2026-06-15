@@ -186,7 +186,12 @@ impl<'a> GraphTraverser<'a> {
 
         let options = TraversalOptions {
             max_depth,
-            edge_kinds: Some(vec![EdgeKind::Calls]),
+            edge_kinds: Some(vec![
+                EdgeKind::Calls,
+                EdgeKind::References,
+                EdgeKind::Imports,
+                EdgeKind::Instantiates,
+            ]),
             node_kinds: None,
             direction: TraversalDirection::Incoming,
             limit: Some(100),
@@ -195,9 +200,10 @@ impl<'a> GraphTraverser<'a> {
         let subgraph = self.traverse_bfs(node_id, options)?;
 
         // Extract caller nodes and edges
+        let caller_kinds = [EdgeKind::Calls, EdgeKind::References, EdgeKind::Imports, EdgeKind::Instantiates];
         let mut callers = Vec::new();
         for edge in &subgraph.edges {
-            if edge.target == node_id && edge.kind == EdgeKind::Calls {
+            if edge.target == node_id && caller_kinds.contains(&edge.kind) {
                 if let Some(node) = subgraph.nodes.get(&edge.source) {
                     callers.push((node.clone(), edge.clone()));
                 }
@@ -213,7 +219,12 @@ impl<'a> GraphTraverser<'a> {
 
         let options = TraversalOptions {
             max_depth,
-            edge_kinds: Some(vec![EdgeKind::Calls]),
+            edge_kinds: Some(vec![
+                EdgeKind::Calls,
+                EdgeKind::References,
+                EdgeKind::Imports,
+                EdgeKind::Instantiates,
+            ]),
             node_kinds: None,
             direction: TraversalDirection::Outgoing,
             limit: Some(100),
@@ -222,9 +233,10 @@ impl<'a> GraphTraverser<'a> {
         let subgraph = self.traverse_bfs(node_id, options)?;
 
         // Extract callee nodes and edges
+        let callee_kinds = [EdgeKind::Calls, EdgeKind::References, EdgeKind::Imports, EdgeKind::Instantiates];
         let mut callees = Vec::new();
         for edge in &subgraph.edges {
-            if edge.source == node_id && edge.kind == EdgeKind::Calls {
+            if edge.source == node_id && callee_kinds.contains(&edge.kind) {
                 if let Some(node) = subgraph.nodes.get(&edge.target) {
                     callees.push((node.clone(), edge.clone()));
                 }
@@ -238,21 +250,73 @@ impl<'a> GraphTraverser<'a> {
     pub fn get_impact_radius(&self, node_id: &str, max_depth: usize) -> Result<Subgraph, Box<dyn std::error::Error>> {
         debug!("Calculating impact radius for node {}", node_id);
 
+        // Collect seed nodes: the target + its children if it's a container
+        let mut seed_ids = vec![node_id.to_string()];
+
+        // Container expansion: if the target is a class/interface/struct/etc.,
+        // recursively include contained children so their callers appear in impact
+        if let Some(node) = self.queries.get_node_by_id(node_id)? {
+            use crate::types::NodeKind;
+            let is_container = matches!(
+                node.kind,
+                NodeKind::Class | NodeKind::Interface | NodeKind::Struct
+                | NodeKind::Trait | NodeKind::Protocol | NodeKind::Module
+                | NodeKind::Enum
+            );
+            if is_container {
+                let contains_opts = TraversalOptions {
+                    max_depth: 10,
+                    edge_kinds: Some(vec![EdgeKind::Contains]),
+                    node_kinds: None,
+                    direction: TraversalDirection::Outgoing,
+                    limit: Some(200),
+                };
+                if let Ok(children) = self.traverse_bfs(node_id, contains_opts) {
+                    for child_id in children.nodes.keys() {
+                        if child_id != node_id {
+                            seed_ids.push(child_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge impact subgraphs from all seeds
+        let mut merged = Subgraph::new();
+        let impact_kinds = vec![
+            EdgeKind::Calls,
+            EdgeKind::References,
+            EdgeKind::Extends,
+            EdgeKind::Implements,
+            EdgeKind::TypeOf,
+        ];
         let options = TraversalOptions {
             max_depth,
-            edge_kinds: Some(vec![
-                EdgeKind::Calls,
-                EdgeKind::References,
-                EdgeKind::Extends,
-                EdgeKind::Implements,
-                EdgeKind::TypeOf,
-            ]),
+            edge_kinds: Some(impact_kinds),
             node_kinds: None,
             direction: TraversalDirection::Incoming,
             limit: Some(500),
         };
 
-        self.traverse_bfs(node_id, options)
+        for seed_id in &seed_ids {
+            if let Ok(sub) = self.traverse_bfs(seed_id, options.clone()) {
+                for (id, node) in sub.nodes {
+                    merged.nodes.entry(id).or_insert(node);
+                }
+                for edge in sub.edges {
+                    merged.edges.push(edge);
+                }
+            }
+        }
+
+        // Deduplicate edges
+        let mut seen: std::collections::HashSet<(String, String, String)> = std::collections::HashSet::new();
+        merged.edges.retain(|e| {
+            let key = (e.source.clone(), e.target.clone(), e.kind.as_str().to_string());
+            seen.insert(key)
+        });
+
+        Ok(merged)
     }
 
     /// Find shortest path between two nodes
