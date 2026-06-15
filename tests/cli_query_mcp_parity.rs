@@ -3,6 +3,7 @@
 //! These tests build small indexed projects and assert stable external behavior
 //! before command internals are refactored.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -30,12 +31,39 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n")
 }
 
-fn mcp_tools_env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+struct McpToolsEnvGuard {
+    previous: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
 
-    LOCK.get_or_init(|| Mutex::new(()))
+fn mcp_tools_env(value: Option<&str>) -> McpToolsEnvGuard {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("CODEGRAPH_MCP_TOOLS env lock poisoned");
+    let previous = std::env::var_os("CODEGRAPH_MCP_TOOLS");
+
+    if let Some(value) = value {
+        std::env::set_var("CODEGRAPH_MCP_TOOLS", value);
+    } else {
+        std::env::remove_var("CODEGRAPH_MCP_TOOLS");
+    }
+
+    McpToolsEnvGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
+impl Drop for McpToolsEnvGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var("CODEGRAPH_MCP_TOOLS", value);
+        } else {
+            std::env::remove_var("CODEGRAPH_MCP_TOOLS");
+        }
+    }
 }
 
 fn fixture_project() -> TempDir {
@@ -464,14 +492,11 @@ fn explore_warns_and_succeeds_when_indexed_source_is_missing() {
 
 #[test]
 fn mcp_default_tool_surface_matches_typescript_default() {
-    let _guard = mcp_tools_env_lock();
-    let previous = std::env::var_os("CODEGRAPH_MCP_TOOLS");
-    std::env::remove_var("CODEGRAPH_MCP_TOOLS");
-    let tools = codegraph::mcp::tools::register_tools();
-    if let Some(value) = previous {
-        std::env::set_var("CODEGRAPH_MCP_TOOLS", value);
-    }
-    let names = tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+    let names = {
+        let _guard = mcp_tools_env(None);
+        let tools = codegraph::mcp::tools::register_tools();
+        tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>()
+    };
     assert_eq!(
         names,
         vec![
@@ -485,16 +510,11 @@ fn mcp_default_tool_surface_matches_typescript_default() {
 
 #[test]
 fn mcp_tool_allowlist_accepts_short_names() {
-    let _guard = mcp_tools_env_lock();
-    let previous = std::env::var_os("CODEGRAPH_MCP_TOOLS");
-    std::env::set_var("CODEGRAPH_MCP_TOOLS", "explore,node,status");
-    let tools = codegraph::mcp::tools::register_tools();
-    if let Some(value) = previous {
-        std::env::set_var("CODEGRAPH_MCP_TOOLS", value);
-    } else {
-        std::env::remove_var("CODEGRAPH_MCP_TOOLS");
-    }
-    let names = tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+    let names = {
+        let _guard = mcp_tools_env(Some("explore,node,status"));
+        let tools = codegraph::mcp::tools::register_tools();
+        tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>()
+    };
     assert_eq!(
         names,
         vec![
