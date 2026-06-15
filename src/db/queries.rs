@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Transaction, params, OptionalExtension};
+use rusqlite::{params, types::Value, Connection, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::str::FromStr;
 use log::debug;
@@ -579,8 +579,8 @@ impl<'a> QueryBuilder<'a> {
     pub fn search_nodes(&self, query: &str, options: Option<&SearchOptions>) -> Result<Vec<SearchResult>, rusqlite::Error> {
         let default_opts = SearchOptions::default();
         let opts = options.unwrap_or(&default_opts);
-        
-        let sql = format!(
+
+        let mut sql = String::from(
             "SELECT n.id, n.kind, n.name, n.qualified_name, n.file_path, n.language,
                     n.start_line, n.end_line, n.start_column, n.end_column,
                     n.docstring, n.signature, n.visibility, n.is_exported,
@@ -589,17 +589,28 @@ impl<'a> QueryBuilder<'a> {
                     rank
              FROM nodes n
              JOIN nodes_fts fts ON n.rowid = fts.rowid
-             WHERE nodes_fts MATCH ?1
-             ORDER BY rank
-             LIMIT ?2"
+             WHERE nodes_fts MATCH ?"
         );
+
+        let escaped_query = escape_fts_query(query);
+        let mut params_values = vec![Value::Text(escaped_query)];
+        if let Some(kinds) = &opts.kinds {
+            if !kinds.is_empty() {
+                let placeholders = vec!["?"; kinds.len()].join(", ");
+                sql.push_str(&format!(" AND n.kind IN ({})", placeholders));
+                params_values.extend(
+                    kinds
+                        .iter()
+                        .map(|kind| Value::Text(kind.as_str().to_string())),
+                );
+            }
+        }
+        sql.push_str(" ORDER BY rank LIMIT ?");
+        params_values.push(Value::Integer(opts.limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
 
-        // Escape FTS5 special characters
-        let escaped_query = escape_fts_query(query);
-
-        let results = stmt.query_map(params![escaped_query, opts.limit], |row| {
+        let results = stmt.query_map(rusqlite::params_from_iter(params_values), |row| {
             let node = Node {
                 id: row.get(0)?,
                 kind: NodeKind::from_str(&row.get::<_, String>(1)?).unwrap(),

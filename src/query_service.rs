@@ -83,7 +83,7 @@ impl<'a> QueryService<'a> {
             kinds => kinds,
         };
         let options = SearchOptions {
-            limit: if kinds.is_some() { limit.max(50) } else { limit },
+            limit,
             kinds: kinds.clone(),
             file_pattern: None,
         };

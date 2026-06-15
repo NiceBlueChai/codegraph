@@ -64,6 +64,52 @@ export function workerMain(name: string) {
     dir
 }
 
+fn many_matching_functions_then_class_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    let project = codegraph::project::resolve_project(Some(
+        dir.path().to_str().expect("temp path is utf-8"),
+    ))
+    .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+    for i in 0..80 {
+        let node = codegraph::types::Node::new(
+            format!("many.ts::SearchTarget#{i}"),
+            codegraph::types::NodeKind::Function,
+            "SearchTarget".to_string(),
+            format!("many.ts::SearchTarget::{i}"),
+            "many.ts".to_string(),
+            codegraph::types::Language::TypeScript,
+            i + 1,
+            i + 1,
+            1,
+            20,
+        );
+        queries.insert_node(&node).expect("insert function node");
+    }
+    let node = codegraph::types::Node::new(
+        "many.ts::SearchTarget#class".to_string(),
+        codegraph::types::NodeKind::Class,
+        "SearchTarget".to_string(),
+        "many.ts::SearchTarget::class".to_string(),
+        "many.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        100,
+        102,
+        1,
+        20,
+    );
+    queries.insert_node(&node).expect("insert class node");
+    dir
+}
+
 #[test]
 fn status_json_is_machine_readable_from_subdirectory() {
     let dir = fixture_project();
@@ -158,6 +204,22 @@ fn query_service_filters_search_results_by_kind() {
         results.is_empty(),
         "class-filtered search should not return functions: {results:?}"
     );
+}
+
+#[test]
+fn query_kind_filter_is_applied_before_limit() {
+    let dir = many_matching_functions_then_class_project();
+    let output = run_codegraph(
+        &["query", "SearchTarget", "--kind", "class", "--limit", "1", "--json"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("query stdout is json");
+    let results = value["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 1, "expected one result:\n{value}");
+    assert_eq!(results[0]["kind"], "class");
 }
 
 #[test]
