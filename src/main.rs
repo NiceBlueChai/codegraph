@@ -675,7 +675,7 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
-            "callers": callers.iter().map(|(node, edge)| {
+            "callers": callers.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
                     "filePath": node.file_path,
@@ -688,11 +688,12 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
+        let visible_callers = callers.iter().take(limit).cloned().collect::<Vec<_>>();
         print!(
             "{}",
             codegraph::query_service::QueryService::render_graph_list(
                 &format!("Callers of '{}'", symbol),
-                &callers,
+                &visible_callers,
             )
         );
     }
@@ -710,7 +711,7 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
-            "callees": callees.iter().map(|(node, edge)| {
+            "callees": callees.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
                     "filePath": node.file_path,
@@ -723,11 +724,12 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
+        let visible_callees = callees.iter().take(limit).cloned().collect::<Vec<_>>();
         print!(
             "{}",
             codegraph::query_service::QueryService::render_graph_list(
                 &format!("Callees of '{}'", symbol),
-                &callees,
+                &visible_callees,
             )
         );
     }

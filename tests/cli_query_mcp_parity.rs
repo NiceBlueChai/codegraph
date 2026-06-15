@@ -288,6 +288,79 @@ fn query_service_graph_methods_return_shared_relationship_results() {
 }
 
 #[test]
+fn callers_json_limit_does_not_change_total() {
+    let dir = fixture_project();
+    let project = codegraph::project::resolve_project(Some(
+        dir.path().to_str().expect("temp path is utf-8"),
+    ))
+    .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+    let options = codegraph::types::SearchOptions {
+        limit: 10,
+        kinds: None,
+        file_pattern: None,
+    };
+    let helper = queries
+        .search_nodes("helper", Some(&options))
+        .expect("search helper")
+        .into_iter()
+        .find(|result| result.node.name == "helper")
+        .expect("helper node")
+        .node;
+    let caller_one = codegraph::types::Node::new(
+        "app.ts::caller_one".to_string(),
+        codegraph::types::NodeKind::Function,
+        "callerOne".to_string(),
+        "app.ts::callerOne".to_string(),
+        "app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        20,
+        22,
+        1,
+        20,
+    );
+    let caller_two = codegraph::types::Node::new(
+        "app.ts::caller_two".to_string(),
+        codegraph::types::NodeKind::Function,
+        "callerTwo".to_string(),
+        "app.ts::callerTwo".to_string(),
+        "app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        30,
+        32,
+        1,
+        20,
+    );
+    for caller in [&caller_two, &caller_one] {
+        queries.insert_node(caller).expect("insert caller");
+        queries
+            .insert_edge(&codegraph::types::Edge::new(
+                caller.id.clone(),
+                helper.id.clone(),
+                codegraph::types::EdgeKind::Calls,
+            ))
+            .expect("insert caller edge");
+    }
+
+    let output = run_codegraph(
+        &["callers", "helper", "--limit", "1", "--json"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("callers stdout is json");
+    let callers = value["callers"].as_array().expect("callers array");
+
+    assert_eq!(callers.len(), 1, "expected limit to apply to emitted callers:\n{value}");
+    assert_eq!(callers[0]["name"], "callerOne");
+    assert!(
+        value["total"].as_u64().unwrap_or(0) >= 2,
+        "expected total to preserve full caller count:\n{value}"
+    );
+}
+
+#[test]
 fn query_kind_filter_is_applied_before_limit() {
     let dir = many_matching_functions_then_class_project();
     let output = run_codegraph(

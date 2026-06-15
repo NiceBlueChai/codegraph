@@ -340,7 +340,7 @@ impl<'a> QueryService<'a> {
     }
 
     /// Finds callers of matching symbols with duplicate caller nodes removed.
-    pub fn callers(&self, symbol: &str, limit: usize) -> anyhow::Result<Vec<(Node, Edge)>> {
+    pub fn callers(&self, symbol: &str, _limit: usize) -> anyhow::Result<Vec<(Node, Edge)>> {
         let matches = self.exact_symbol_matches(symbol, 50)?;
         let traverser = GraphTraverser::new(QueryBuilder::new(self.queries.get_conn()));
         let mut seen = HashSet::new();
@@ -355,12 +355,12 @@ impl<'a> QueryService<'a> {
                 }
             }
         }
-        out.truncate(limit);
+        sort_graph_items(&mut out);
         Ok(out)
     }
 
     /// Finds callees of matching symbols with duplicate callee nodes removed.
-    pub fn callees(&self, symbol: &str, limit: usize) -> anyhow::Result<Vec<(Node, Edge)>> {
+    pub fn callees(&self, symbol: &str, _limit: usize) -> anyhow::Result<Vec<(Node, Edge)>> {
         let matches = self.exact_symbol_matches(symbol, 50)?;
         let traverser = GraphTraverser::new(QueryBuilder::new(self.queries.get_conn()));
         let mut seen = HashSet::new();
@@ -375,7 +375,7 @@ impl<'a> QueryService<'a> {
                 }
             }
         }
-        out.truncate(limit);
+        sort_graph_items(&mut out);
         Ok(out)
     }
 
@@ -485,6 +485,18 @@ fn parse_node_kinds(kind: Option<&str>) -> Option<Vec<NodeKind>> {
 
 fn relationship_warning(kind: &str, error: &dyn std::fmt::Display) -> String {
     format!("  Warning: failed to load {}: {}\n", kind, error)
+}
+
+fn sort_graph_items(items: &mut [(Node, Edge)]) {
+    items.sort_by(|(left_node, left_edge), (right_node, right_edge)| {
+        left_node
+            .file_path
+            .cmp(&right_node.file_path)
+            .then(left_node.start_line.cmp(&right_node.start_line))
+            .then(left_node.name.cmp(&right_node.name))
+            .then(left_node.id.cmp(&right_node.id))
+            .then(left_edge.kind.as_str().cmp(right_edge.kind.as_str()))
+    });
 }
 
 fn normalize_path(path: &str) -> String {
