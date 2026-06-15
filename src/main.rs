@@ -530,28 +530,27 @@ fn cmd_sync(path: &str, quiet: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
     use std::fs;
 
-    if !codegraph::db::is_initialized(path) {
-        if json {
-            println!("{{\"initialized\": false}}");
-        } else {
-            println!("CodeGraph not initialized");
+    let project = match codegraph::project::resolve_project(Some(path)) {
+        Ok(project) => project,
+        Err(_) if json => {
+            println!("{}", serde_json::json!({"initialized": false}));
+            return Ok(());
         }
-        return Ok(());
-    }
+        Err(_) => {
+            println!("CodeGraph not initialized");
+            return Ok(());
+        }
+    };
 
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+    let db = project.open_database()?;
     let queries = QueryBuilder::new(db.get_conn());
     let stats = queries.get_stats()?;
     let nodes_by_kind = queries.get_nodes_by_kind_counts().unwrap_or_default();
     let languages: Vec<String> = queries.get_languages().unwrap_or_default();
     let files_by_lang = queries.get_file_counts_by_language().unwrap_or_default();
-
-    // Get DB file size
-    let db_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let db_size_bytes = fs::metadata(&project.db_path).map(|m| m.len()).unwrap_or(0);
 
     if json {
         let output = serde_json::json!({
@@ -571,6 +570,7 @@ fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("CodeGraph Status:");
+        println!("  Root: {}", project.root.display());
         println!("  Version: {}", env!("CARGO_PKG_VERSION"));
         println!("  Backend: {:?}", db.get_backend());
         println!("  Journal Mode: {}", db.get_journal_mode().unwrap_or_else(|_| "unknown".to_string()));
