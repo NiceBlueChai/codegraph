@@ -112,6 +112,55 @@ fn files_json_has_stable_shape() {
 }
 
 #[test]
+fn files_json_no_metadata_omits_metadata_fields() {
+    let dir = fixture_project();
+    let output = run_codegraph(
+        &["files", "--format", "flat", "--json", "--no-metadata"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("files stdout is json");
+    let file = value["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .find(|f| f["path"] == "app.ts")
+        .expect("app.ts entry");
+    assert!(file.get("path").is_some(), "expected path field:\n{file}");
+    assert!(
+        file.get("language").is_none(),
+        "unexpected language field:\n{file}"
+    );
+    assert!(
+        file.get("node_count").is_none(),
+        "unexpected node_count field:\n{file}"
+    );
+    assert!(file.get("size").is_none(), "unexpected size field:\n{file}");
+}
+
+#[test]
+fn query_service_filters_search_results_by_kind() {
+    let dir = fixture_project();
+    let project = codegraph::project::resolve_project(Some(
+        dir.path().to_str().expect("temp path is utf-8"),
+    ))
+    .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let service = codegraph::query_service::QueryService::new(
+        project,
+        codegraph::db::QueryBuilder::new(db.get_conn()),
+    );
+
+    let results = service.search("helper", 10, Some("class")).expect("search");
+
+    assert!(
+        results.is_empty(),
+        "class-filtered search should not return functions: {results:?}"
+    );
+}
+
+#[test]
 fn explore_returns_source_without_prior_query() {
     let dir = fixture_project();
     let output = run_codegraph(&["explore", "runApp helper", "--max-files", "2"], dir.path());

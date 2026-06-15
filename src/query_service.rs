@@ -13,7 +13,7 @@ use crate::context_formatter;
 use crate::core::query::GraphTraverser;
 use crate::db::QueryBuilder;
 use crate::project::ProjectContext;
-use crate::types::{Edge, FileRecord, Node, SearchOptions, SearchResult};
+use crate::types::{Edge, FileRecord, Node, NodeKind, SearchOptions, SearchResult};
 
 /// Source content and dependency metadata for an indexed file.
 #[derive(Debug, Serialize)]
@@ -46,12 +46,15 @@ pub struct FilesListing {
 pub struct FileListingEntry {
     /// Indexed project-relative file path.
     pub path: String,
-    /// File language name.
-    pub language: String,
-    /// Number of indexed symbols in the file.
-    pub node_count: u32,
-    /// File size in bytes.
-    pub size: u64,
+    /// File language name when metadata is requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Number of indexed symbols in the file when metadata is requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_count: Option<u32>,
+    /// File size in bytes when metadata is requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// Shared query facade used by CLI commands and MCP handlers.
@@ -75,16 +78,21 @@ impl<'a> QueryService<'a> {
         limit: usize,
         kind: Option<&str>,
     ) -> anyhow::Result<Vec<SearchResult>> {
+        let kinds = match parse_node_kinds(kind) {
+            Some(kinds) if kinds.is_empty() => return Ok(Vec::new()),
+            kinds => kinds,
+        };
         let options = SearchOptions {
-            limit,
-            kinds: kind.map(|k| {
-                k.split(',')
-                    .filter_map(|s| crate::types::NodeKind::from_str(s.trim()))
-                    .collect()
-            }),
+            limit: if kinds.is_some() { limit.max(50) } else { limit },
+            kinds: kinds.clone(),
             file_pattern: None,
         };
-        Ok(self.queries.search_nodes(query, Some(&options))?)
+        let mut results = self.queries.search_nodes(query, Some(&options))?;
+        if let Some(kinds) = kinds {
+            results.retain(|result| kinds.contains(&result.node.kind));
+            results.truncate(limit);
+        }
+        Ok(results)
     }
 
     /// Finds exact symbol-name matches, falling back to the best search result.
@@ -150,6 +158,7 @@ impl<'a> QueryService<'a> {
         &self,
         filter: Option<&str>,
         pattern: Option<&str>,
+        include_metadata: bool,
     ) -> anyhow::Result<FilesListing> {
         let mut files = self.queries.get_all_files()?;
         let matcher = match pattern {
@@ -177,9 +186,9 @@ impl<'a> QueryService<'a> {
             .into_iter()
             .map(|file| FileListingEntry {
                 path: file.path,
-                language: file.language.as_str().to_string(),
-                node_count: file.node_count,
-                size: file.size,
+                language: include_metadata.then(|| file.language.as_str().to_string()),
+                node_count: include_metadata.then_some(file.node_count),
+                size: include_metadata.then_some(file.size),
             })
             .collect::<Vec<_>>();
 
@@ -246,31 +255,43 @@ impl<'a> QueryService<'a> {
                 node.start_line
             ));
 
-            let callers = traverser.get_callers(&node.id, 1).unwrap_or_default();
-            if !callers.is_empty() {
-                out.push_str("  Called by:\n");
-                for (caller, _) in callers.iter().take(5) {
-                    out.push_str(&format!(
-                        "  - {} ({}) at {}:{}\n",
-                        caller.name,
-                        caller.kind.as_str(),
-                        caller.file_path,
-                        caller.start_line
-                    ));
+            match traverser.get_callers(&node.id, 1) {
+                Ok(callers) => {
+                    if !callers.is_empty() {
+                        out.push_str("  Called by:\n");
+                        for (caller, _) in callers.iter().take(5) {
+                            out.push_str(&format!(
+                                "  - {} ({}) at {}:{}\n",
+                                caller.name,
+                                caller.kind.as_str(),
+                                caller.file_path,
+                                caller.start_line
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    out.push_str(&format!("  Warning: failed to load callers: {}\n", error));
                 }
             }
 
-            let callees = traverser.get_callees(&node.id, 1).unwrap_or_default();
-            if !callees.is_empty() {
-                out.push_str("  Calls:\n");
-                for (callee, _) in callees.iter().take(5) {
-                    out.push_str(&format!(
-                        "  - {} ({}) at {}:{}\n",
-                        callee.name,
-                        callee.kind.as_str(),
-                        callee.file_path,
-                        callee.start_line
-                    ));
+            match traverser.get_callees(&node.id, 1) {
+                Ok(callees) => {
+                    if !callees.is_empty() {
+                        out.push_str("  Calls:\n");
+                        for (callee, _) in callees.iter().take(5) {
+                            out.push_str(&format!(
+                                "  - {} ({}) at {}:{}\n",
+                                callee.name,
+                                callee.kind.as_str(),
+                                callee.file_path,
+                                callee.start_line
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    out.push_str(&format!("  Warning: failed to load callees: {}\n", error));
                 }
             }
         }
@@ -370,6 +391,23 @@ fn resolve_file_hint_from_records(file_hint: &str, files: &[FileRecord]) -> anyh
             many.join(", ")
         ),
     }
+}
+
+fn parse_node_kinds(kind: Option<&str>) -> Option<Vec<NodeKind>> {
+    kind.map(|raw| {
+        let mut kinds = Vec::new();
+        let mut invalid = false;
+        for part in raw.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+            match NodeKind::from_str(part) {
+                Some(kind) => kinds.push(kind),
+                None => {
+                    invalid = true;
+                    break;
+                }
+            }
+        }
+        if invalid { Vec::new() } else { kinds }
+    })
 }
 
 fn normalize_path(path: &str) -> String {

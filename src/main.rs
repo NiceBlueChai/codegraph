@@ -1017,7 +1017,7 @@ fn cmd_files(
 
     if json {
         let service = codegraph::query_service::QueryService::new(project, queries);
-        let output = service.list_files(filter, pattern)?;
+        let output = service.list_files(filter, pattern, !no_metadata)?;
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
