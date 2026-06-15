@@ -53,24 +53,27 @@ impl<'a> Indexer<'a> {
             };
 
             // Quick hash check to skip unchanged files
-            if let Ok(content) = fs::read_to_string(file_path) {
-                let hash = self.hash_content(&content);
-                if let Some(existing) = self.queries.get_file_by_path(&rel_path)? {
-                    if existing.content_hash == hash {
-                        result.files_skipped += 1;
-                        continue;
+            match fs::read_to_string(file_path) {
+                Ok(content) => {
+                    let hash = self.hash_content(&content);
+                    if let Some(existing) = self.queries.get_file_by_path(&rel_path)? {
+                        if existing.content_hash == hash {
+                            result.files_skipped += 1;
+                            continue;
+                        }
+                        // Delete old nodes for modified file
+                        self.queries.delete_nodes_for_file(&rel_path).ok();
                     }
-                    // Delete old nodes for modified file
-                    self.queries.delete_nodes_for_file(&rel_path).ok();
+                    files_to_parse.push((file_path.clone(), rel_path));
                 }
-                files_to_parse.push((file_path.clone(), rel_path));
-            } else {
-                result.files_errored += 1;
-                result.errors.push(IndexError {
-                    message: format!("Failed to read file"),
-                    severity: "error".into(),
-                    file_path: Some(file_path.display().to_string()),
-                });
+                Err(e) => {
+                    result.files_errored += 1;
+                    result.errors.push(IndexError {
+                        message: format!("{}", e),
+                        severity: "error".into(),
+                        file_path: Some(file_path.display().to_string()),
+                    });
+                }
             }
         }
 
@@ -204,7 +207,7 @@ impl<'a> Indexer<'a> {
 
         // Get indexed files from DB
         let db_files = self.queries.get_all_files()?;
-        let db_file_set: std::collections::HashSet<String> = db_files
+        let _db_file_set: std::collections::HashSet<String> = db_files
             .iter()
             .map(|f| f.path.clone())
             .collect();
