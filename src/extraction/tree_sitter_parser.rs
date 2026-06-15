@@ -290,8 +290,19 @@ impl TreeSitterParser {
         // Extract extends relationship
         if let Some(super_clause) = self.find_child(node, "class_heritage") {
             if let Some(parent_name) = self.get_node_text_parts(super_clause, source).first() {
-                let parent_id = format!("{}::{}#0", file_path, parent_name);
-                result.edges.push(Edge::new(id.clone(), parent_id, EdgeKind::Extends));
+                // Create unresolved reference for resolution
+                let uref = UnresolvedReference {
+                    id: Some(0),
+                    from_node_id: id.clone(),
+                    reference_name: parent_name.clone(),
+                    reference_kind: "extends".to_string(),
+                    line: (start.row + 1) as u32,
+                    col: start.column as u32,
+                    candidates: None,
+                    file_path: file_path.to_string(),
+                    language: "unknown".to_string(),
+                };
+                result.unresolved_refs.push(uref);
             }
         }
     }
@@ -643,17 +654,10 @@ impl TreeSitterParser {
                 // Try to find parent function
                 let caller_id = self.find_enclosing_function_id(node, file_path);
                 if let Some(caller) = caller_id {
-                    let callee_id = format!("{}::{}#0", file_path, callee);
-                    result.edges.push(Edge::new(caller, callee_id, EdgeKind::Calls));
-
-                    // Also create unresolved ref for resolution
+                    // Create unresolved ref for resolution
                     let uref = UnresolvedReference {
                         id: Some(0),
-                        from_node_id: result
-                            .nodes
-                            .last()
-                            .map(|n| n.id.clone())
-                            .unwrap_or_default(),
+                        from_node_id: caller,
                         reference_name: callee,
                         reference_kind: "call".to_string(),
                         line: (node.start_position().row + 1) as u32,

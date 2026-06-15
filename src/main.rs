@@ -19,6 +19,10 @@ enum Commands {
         /// Project root directory
         #[arg(default_value = ".")]
         path: String,
+
+        /// Show detailed worker lifecycle and memory info
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Index the project
@@ -26,6 +30,18 @@ enum Commands {
         /// Project root directory
         #[arg(default_value = ".")]
         path: String,
+
+        /// Force full re-index (clear existing data)
+        #[arg(short, long)]
+        force: bool,
+
+        /// Suppress progress output
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Show detailed worker lifecycle and memory info
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Sync changes
@@ -33,6 +49,10 @@ enum Commands {
         /// Project root directory
         #[arg(default_value = ".")]
         path: String,
+
+        /// Suppress output (for git hooks)
+        #[arg(short, long)]
+        quiet: bool,
     },
 
     /// Show project status
@@ -40,6 +60,10 @@ enum Commands {
         /// Project root directory
         #[arg(default_value = ".")]
         path: String,
+
+        /// Output as JSON
+        #[arg(short, long)]
+        json: bool,
     },
 
     /// Query symbols
@@ -48,15 +72,35 @@ enum Commands {
         query: String,
 
         /// Project root directory
-        #[arg(default_value = ".")]
+        #[arg(short, long, default_value = ".")]
         path: String,
+
+        /// Maximum results
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+
+        /// Filter by node kind (function, class, etc.)
+        #[arg(short = 'k', long)]
+        kind: Option<String>,
+
+        /// Output as JSON
+        #[arg(short, long)]
+        json: bool,
     },
 
     /// Start MCP server
     Serve {
-        /// Run in MCP mode
+        /// Project root directory (MCP mode uses client's rootUri)
+        #[arg(short, long)]
+        path: Option<String>,
+
+        /// Run in MCP mode (stdio transport)
         #[arg(long)]
         mcp: bool,
+
+        /// Disable file watcher (no auto-sync; slower filesystems like WSL2 /mnt)
+        #[arg(long)]
+        no_watch: bool,
     },
 
     /// Find callers of a symbol
@@ -156,9 +200,11 @@ enum Commands {
         /// Output as JSON
         #[arg(short, long)]
         json: bool,
-    },
 
-    /// Explore symbol area: source + call paths
+        /// Hide file metadata (language, symbol count)
+        #[arg(long)]
+        no_metadata: bool,
+    },
     Explore {
         /// Query terms
         query: Vec<String>,
@@ -287,29 +333,29 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Init { path }) => {
+        Some(Commands::Init { path, verbose }) => {
             info!("Initializing CodeGraph project at {}", path);
-            cmd_init(&path)?;
+            cmd_init(&path, verbose)?;
         }
-        Some(Commands::Index { path }) => {
+        Some(Commands::Index { path, force, quiet, verbose }) => {
             info!("Indexing project at {}", path);
-            cmd_index(&path)?;
+            cmd_index(&path, force, quiet, verbose)?;
         }
-        Some(Commands::Sync { path }) => {
+        Some(Commands::Sync { path, quiet }) => {
             info!("Syncing changes at {}", path);
-            cmd_sync(&path)?;
+            cmd_sync(&path, quiet)?;
         }
-        Some(Commands::Status { path }) => {
+        Some(Commands::Status { path, json }) => {
             info!("Checking status at {}", path);
-            cmd_status(&path)?;
+            cmd_status(&path, json)?;
         }
-        Some(Commands::Query { query, path }) => {
+        Some(Commands::Query { query, path, limit, kind, json }) => {
             info!("Querying at {}: {}", path, query);
-            cmd_query(&path, &query)?;
+            cmd_query(&path, &query, limit, kind.as_deref(), json)?;
         }
-        Some(Commands::Serve { mcp }) => {
+        Some(Commands::Serve { path, mcp, no_watch }) => {
             info!("Starting MCP server (mcp={})", mcp);
-            cmd_serve(mcp)?;
+            cmd_serve(path.as_deref(), mcp, no_watch)?;
         }
         Some(Commands::Callers { symbol, path, limit, json }) => {
             info!("Finding callers of '{}' at {}", symbol, path);
@@ -331,9 +377,9 @@ fn main() -> anyhow::Result<()> {
             info!("Unlocking project at {}", path);
             cmd_unlock(&path)?;
         }
-        Some(Commands::Files { path, filter, pattern, format, max_depth, json }) => {
+        Some(Commands::Files { path, filter, pattern, format, max_depth, json, no_metadata }) => {
             info!("Showing files at {}", path);
-            cmd_files(&path, filter.as_deref(), pattern.as_deref(), &format, max_depth, json)?;
+            cmd_files(&path, filter.as_deref(), pattern.as_deref(), &format, max_depth, json, no_metadata)?;
         }
         Some(Commands::Explore { query, path, max_files }) => {
             info!("Exploring at {}: {:?}", path, query);
@@ -368,8 +414,12 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_init(path: &str) -> anyhow::Result<()> {
+fn cmd_init(path: &str, verbose: bool) -> anyhow::Result<()> {
     use codegraph::db::{get_database_path, create_directory};
+
+    if verbose {
+        log::info!("Initializing CodeGraph at {} (verbose)", path);
+    }
 
     create_directory(path)?;
 
@@ -387,33 +437,50 @@ fn cmd_init(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_index(path: &str) -> anyhow::Result<()> {
+fn cmd_index(path: &str, force: bool, quiet: bool, verbose: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
     use codegraph::core::indexer::Indexer;
 
     if !codegraph::db::is_initialized(path) {
         anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
+    }
+
+    if verbose {
+        log::info!("Indexing at {} (force={}, verbose)", path, force);
     }
 
     let db_path = get_database_path(path);
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
     initialize_schema(db.get_conn())?;
 
+    // Force full re-index by clearing existing data
+    if force {
+        if !quiet {
+            println!("Forcing full re-index (clearing existing data)...");
+        }
+        let queries = QueryBuilder::new(db.get_conn());
+        queries.clear().map_err(|e| anyhow::anyhow!("Failed to clear data: {}", e))?;
+    }
+
     let queries = QueryBuilder::new(db.get_conn());
     let indexer = Indexer::new(queries, path);
 
-    println!("Indexing...");
+    if !quiet {
+        println!("Indexing...");
+    }
     let result = indexer.index_all().map_err(|e| anyhow::anyhow!("Indexing failed: {}", e))?;
-    println!("✓ Indexing complete");
-    println!("  Files indexed: {}", result.files_indexed);
-    println!("  Files skipped: {}", result.files_skipped);
-    println!("  Nodes created: {}", result.nodes_created);
-    println!("  Edges created: {}", result.edges_created);
+    if !quiet {
+        println!("✓ Indexing complete");
+        println!("  Files indexed: {}", result.files_indexed);
+        println!("  Files skipped: {}", result.files_skipped);
+        println!("  Nodes created: {}", result.nodes_created);
+        println!("  Edges created: {}", result.edges_created);
+    }
 
     Ok(())
 }
 
-fn cmd_sync(path: &str) -> anyhow::Result<()> {
+fn cmd_sync(path: &str, quiet: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
     use codegraph::core::indexer::Indexer;
 
@@ -424,24 +491,32 @@ fn cmd_sync(path: &str) -> anyhow::Result<()> {
     let db_path = get_database_path(path);
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
 
-    println!("Syncing...");
+    if !quiet {
+        println!("Syncing...");
+    }
     let indexer = Indexer::new(QueryBuilder::new(db.get_conn()), path);
     let result = indexer.sync().map_err(|e| anyhow::anyhow!("Sync failed: {}", e))?;
 
-    println!("✓ Sync complete");
-    println!("  Files checked: {}", result.files_checked);
-    println!("  Files added: {}", result.files_added);
-    println!("  Files modified: {}", result.files_modified);
-    println!("  Duration: {}ms", result.duration_ms);
+    if !quiet {
+        println!("✓ Sync complete");
+        println!("  Files checked: {}", result.files_checked);
+        println!("  Files added: {}", result.files_added);
+        println!("  Files modified: {}", result.files_modified);
+        println!("  Duration: {}ms", result.duration_ms);
+    }
 
     Ok(())
 }
 
-fn cmd_status(path: &str) -> anyhow::Result<()> {
+fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
 
     if !codegraph::db::is_initialized(path) {
-        println!("CodeGraph not initialized");
+        if json {
+            println!("{{\"initialized\": false}}");
+        } else {
+            println!("CodeGraph not initialized");
+        }
         return Ok(());
     }
 
@@ -450,18 +525,31 @@ fn cmd_status(path: &str) -> anyhow::Result<()> {
     let queries = QueryBuilder::new(db.get_conn());
     let stats = queries.get_stats()?;
 
-    println!("CodeGraph Status:");
-    println!("  Backend: {:?}", db.get_backend());
-    println!("  Journal Mode: {}", db.get_journal_mode().unwrap_or_else(|_| "unknown".to_string()));
-    println!("  Nodes: {}", stats.node_count);
-    println!("  Edges: {}", stats.edge_count);
-    println!("  Files: {}", stats.file_count);
-    println!("  Unresolved Refs: {}", stats.unresolved_ref_count);
+    if json {
+        let output = serde_json::json!({
+            "initialized": true,
+            "backend": format!("{:?}", db.get_backend()),
+            "journal_mode": db.get_journal_mode().unwrap_or_else(|_| "unknown".to_string()),
+            "nodes": stats.node_count,
+            "edges": stats.edge_count,
+            "files": stats.file_count,
+            "unresolved_refs": stats.unresolved_ref_count,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("CodeGraph Status:");
+        println!("  Backend: {:?}", db.get_backend());
+        println!("  Journal Mode: {}", db.get_journal_mode().unwrap_or_else(|_| "unknown".to_string()));
+        println!("  Nodes: {}", stats.node_count);
+        println!("  Edges: {}", stats.edge_count);
+        println!("  Files: {}", stats.file_count);
+        println!("  Unresolved Refs: {}", stats.unresolved_ref_count);
+    }
 
     Ok(())
 }
 
-fn cmd_query(path: &str, query: &str) -> anyhow::Result<()> {
+fn cmd_query(path: &str, query: &str, limit: usize, kind: Option<&str>, json: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
 
     if !codegraph::db::is_initialized(path) {
@@ -472,14 +560,37 @@ fn cmd_query(path: &str, query: &str) -> anyhow::Result<()> {
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
     let queries = QueryBuilder::new(db.get_conn());
 
-    let options = codegraph::types::SearchOptions::default();
+    let options = codegraph::types::SearchOptions {
+        limit,
+        kinds: kind.map(|k| {
+            k.split(',')
+                .filter_map(|s| codegraph::types::NodeKind::from_str(s.trim()))
+                .collect()
+        }),
+        file_pattern: None,
+    };
     let results = queries.search_nodes(query, Some(&options))?;
 
-    if results.is_empty() {
+    if json {
+        let output = serde_json::json!({
+            "query": query,
+            "results": results.iter().take(limit).map(|r| {
+                serde_json::json!({
+                    "name": r.node.name,
+                    "kind": r.node.kind.as_str(),
+                    "file": r.node.file_path,
+                    "line": r.node.start_line,
+                    "signature": r.node.signature,
+                })
+            }).collect::<Vec<_>>(),
+            "total": results.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if results.is_empty() {
         println!("No results found for '{}'", query);
     } else {
         println!("Found {} results for '{}':", results.len(), query);
-        for result in &results {
+        for result in results.iter().take(limit) {
             println!("  - {} ({}) in {}", result.node.name, result.node.kind.as_str(), result.node.file_path);
             if let Some(ref sig) = result.node.signature {
                 println!("    Signature: {}", sig);
@@ -490,12 +601,12 @@ fn cmd_query(path: &str, query: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_serve(mcp: bool) -> anyhow::Result<()> {
+fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
 
     if mcp {
-        // Get project root (current directory by default)
-        let project_root = ".";
+        // Use specified path or current directory
+        let project_root = path.unwrap_or(".");
 
         if !codegraph::db::is_initialized(project_root) {
             anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
@@ -510,6 +621,9 @@ fn cmd_serve(mcp: bool) -> anyhow::Result<()> {
     } else {
         println!("Starting MCP server...");
         println!("Use --mcp flag to start in MCP mode");
+        if no_watch {
+            println!("  File watcher: disabled");
+        }
     }
 
     Ok(())
@@ -712,6 +826,7 @@ fn cmd_files(
     format: &str,
     max_depth: Option<usize>,
     json: bool,
+    no_metadata: bool,
 ) -> anyhow::Result<()> {
     use std::path::Path;
     use ignore::WalkBuilder;
