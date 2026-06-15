@@ -68,3 +68,6 @@ assets/generate-waitlist.py
 # Added by cargo
 
 /target
+
+# Local isolated implementation worktrees
+.worktrees/
