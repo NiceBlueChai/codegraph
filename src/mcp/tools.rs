@@ -1,43 +1,123 @@
+//! MCP tool registry, advertised schemas, server instructions, and legacy handlers.
+
 use serde_json::{json, Value};
 use crate::db::QueryBuilder;
 use crate::core::query::GraphTraverser;
 use crate::mcp::protocol::{ToolDefinition, ToolInputSchema, CallToolResult, ContentBlock};
 
-/// Register all available MCP tools
+const TOOL_PREFIX: &str = "codegraph_";
+const DEFAULT_TOOLS: &[&str] = &["explore", "node", "search", "callers"];
+
+/// Register the TypeScript-compatible MCP tool surface.
 pub fn register_tools() -> Vec<ToolDefinition> {
-    vec![
-        query_tool(),
-        callers_tool(),
-        callees_tool(),
-        impact_tool(),
-        search_tool(),
-        stats_tool(),
-    ]
+    let requested_tools = std::env::var("CODEGRAPH_MCP_TOOLS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(normalize_tool_name)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| {
+            DEFAULT_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect()
+        });
+
+    requested_tools
+        .iter()
+        .filter_map(|name| tool_by_short_name(name.as_str()))
+        .collect()
 }
 
-/// Query tool: Find symbols by name
-fn query_tool() -> ToolDefinition {
+/// Return concise usage instructions for MCP clients.
+pub fn server_instructions(active: bool) -> String {
+    if active {
+        "CodeGraph is active. Start with codegraph_explore to understand relevant files, use \
+         codegraph_node for file snippets or symbol details, codegraph_search to locate code, and \
+         codegraph_callers to inspect call sites."
+            .to_string()
+    } else {
+        "CodeGraph is inactive for this workspace. Run `codegraph init -i` in the project before \
+         using MCP tools."
+            .to_string()
+    }
+}
+
+fn normalize_tool_name(name: &str) -> &str {
+    name.trim().strip_prefix(TOOL_PREFIX).unwrap_or(name.trim())
+}
+
+fn tool_by_short_name(name: &str) -> Option<ToolDefinition> {
+    match name {
+        "explore" => Some(explore_tool()),
+        "node" => Some(node_tool()),
+        "search" => Some(search_tool()),
+        "callers" => Some(callers_tool()),
+        "callees" => Some(callees_tool()),
+        "impact" => Some(impact_tool()),
+        "files" => Some(files_tool()),
+        "status" => Some(status_tool()),
+        _ => None,
+    }
+}
+
+/// Explore tool: Find relevant files and symbols for a natural-language query.
+fn explore_tool() -> ToolDefinition {
     ToolDefinition {
-        name: "codegraph_query".to_string(),
-        description: "Search for symbols (functions, classes, variables) by name in the codebase".to_string(),
+        name: "codegraph_explore".to_string(),
+        description: "Explore relevant code files and symbols for a query before drilling into details.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "name": {
+                "query": {
                     "type": "string",
-                    "description": "Symbol name to search for"
+                    "description": "Question, feature, or symbol area to explore"
                 },
-                "kind": {
-                    "type": "string",
-                    "description": "Optional symbol kind filter (function, class, method, etc.)",
-                    "enum": ["function", "class", "method", "interface", "struct", "variable"]
-                },
-                "file_pattern": {
-                    "type": "string",
-                    "description": "Optional file pattern to filter results"
+                "maxFiles": {
+                    "type": "integer",
+                    "description": "Maximum number of files to include"
                 }
             })),
-            required: Some(vec!["name".to_string()]),
+            required: Some(vec!["query".to_string()]),
+        },
+    }
+}
+
+/// Node tool: Inspect a file range or symbol details.
+fn node_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "codegraph_node".to_string(),
+        description: "Inspect source for a file or retrieve details for symbols in the code graph.".to_string(),
+        input_schema: ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name to inspect"
+                },
+                "file": {
+                    "type": "string",
+                    "description": "File path to read from the indexed project"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "One-based starting line offset for file reads"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines or symbols to return"
+                },
+                "symbolsOnly": {
+                    "type": "boolean",
+                    "description": "Return symbol summaries without source text"
+                }
+            })),
+            required: Some(vec![]),
         },
     }
 }
@@ -46,21 +126,20 @@ fn query_tool() -> ToolDefinition {
 fn callers_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_callers".to_string(),
-        description: "Find all callers of a specific function or method".to_string(),
+        description: "Find call sites that reference a function, method, or symbol.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "symbol_name": {
+                "symbol": {
                     "type": "string",
-                    "description": "Name of the function or method"
+                    "description": "Function, method, or symbol to find callers for"
                 },
-                "max_depth": {
+                "limit": {
                     "type": "integer",
-                    "description": "Maximum depth to search for callers (default: 1)",
-                    "default": 1
+                    "description": "Maximum number of callers to return"
                 }
             })),
-            required: Some(vec!["symbol_name".to_string()]),
+            required: Some(vec!["symbol".to_string()]),
         },
     }
 }
@@ -69,21 +148,20 @@ fn callers_tool() -> ToolDefinition {
 fn callees_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_callees".to_string(),
-        description: "Find all functions called by a specific function or method".to_string(),
+        description: "Find functions, methods, or symbols called by a target symbol.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "symbol_name": {
+                "symbol": {
                     "type": "string",
-                    "description": "Name of the function or method"
+                    "description": "Function, method, or symbol to find callees for"
                 },
-                "max_depth": {
+                "limit": {
                     "type": "integer",
-                    "description": "Maximum depth to search for callees (default: 1)",
-                    "default": 1
+                    "description": "Maximum number of callees to return"
                 }
             })),
-            required: Some(vec!["symbol_name".to_string()]),
+            required: Some(vec!["symbol".to_string()]),
         },
     }
 }
@@ -92,21 +170,24 @@ fn callees_tool() -> ToolDefinition {
 fn impact_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_impact".to_string(),
-        description: "Analyze the impact radius of changing a specific symbol".to_string(),
+        description: "Analyze the upstream impact of changing a function, method, or symbol.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "symbol_name": {
+                "symbol": {
                     "type": "string",
-                    "description": "Name of the symbol to analyze"
+                    "description": "Function, method, or symbol to analyze"
                 },
-                "max_depth": {
+                "depth": {
                     "type": "integer",
-                    "description": "Maximum depth for impact analysis (default: 3)",
-                    "default": 3
+                    "description": "Maximum relationship depth to traverse"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of impacted nodes to return"
                 }
             })),
-            required: Some(vec!["symbol_name".to_string()]),
+            required: Some(vec!["symbol".to_string()]),
         },
     }
 }
@@ -115,18 +196,17 @@ fn impact_tool() -> ToolDefinition {
 fn search_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_search".to_string(),
-        description: "Perform full-text search across the codebase".to_string(),
+        description: "Search indexed code text and symbols to locate relevant definitions.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "query": {
                     "type": "string",
-                    "description": "Search query text"
+                    "description": "Search query text or symbol fragment"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results (default: 20)",
-                    "default": 20
+                    "description": "Maximum number of search results to return"
                 }
             })),
             required: Some(vec!["query".to_string()]),
@@ -134,11 +214,46 @@ fn search_tool() -> ToolDefinition {
     }
 }
 
-/// Stats tool: Get graph statistics
-fn stats_tool() -> ToolDefinition {
+/// Files tool: List indexed files with optional filtering and formatting.
+fn files_tool() -> ToolDefinition {
     ToolDefinition {
-        name: "codegraph_stats".to_string(),
-        description: "Get statistics about the code graph (node count, edge count, etc.)".to_string(),
+        name: "codegraph_files".to_string(),
+        description: "List indexed files with optional filters and output controls.".to_string(),
+        input_schema: ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "filter": {
+                    "type": "string",
+                    "description": "Text filter for indexed file paths"
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern used to match file paths"
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Output shape for file listings",
+                    "enum": ["tree", "flat"]
+                },
+                "maxDepth": {
+                    "type": "integer",
+                    "description": "Maximum directory depth for tree output"
+                },
+                "noMetadata": {
+                    "type": "boolean",
+                    "description": "Omit language, size, and graph metadata"
+                }
+            })),
+            required: Some(vec![]),
+        },
+    }
+}
+
+/// Status tool: Report CodeGraph workspace index status.
+fn status_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "codegraph_status".to_string(),
+        description: "Show whether CodeGraph is initialized and summarize indexed graph metadata.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({})),

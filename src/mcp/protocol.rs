@@ -1,3 +1,5 @@
+//! MCP JSON-RPC protocol data structures exchanged by the server transport.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,6 +56,8 @@ pub struct InitializeResult {
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
     pub server_info: ServerInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

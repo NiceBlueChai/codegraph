@@ -1,3 +1,5 @@
+//! MCP server request dispatcher for stdio JSON-RPC clients.
+
 use serde_json::{json, Value};
 use log::{info, debug};
 use crate::db::QueryBuilder;
@@ -100,6 +102,7 @@ impl<'a> MCPServer<'a> {
                 name: "CodeGraph".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
+            instructions: Some(crate::mcp::tools::server_instructions(self.queries.is_some())),
         };
 
         JsonRpcResponse {
