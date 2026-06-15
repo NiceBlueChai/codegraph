@@ -6,31 +6,45 @@ use crate::core::query::GraphTraverser;
 use crate::mcp::protocol::{ToolDefinition, ToolInputSchema, CallToolResult, ContentBlock};
 
 const TOOL_PREFIX: &str = "codegraph_";
+const ALL_TOOLS: &[&str] = &[
+    "explore",
+    "node",
+    "search",
+    "callers",
+    "callees",
+    "impact",
+    "files",
+    "status",
+];
 const DEFAULT_TOOLS: &[&str] = &["explore", "node", "search", "callers"];
 
 /// Register the TypeScript-compatible MCP tool surface.
 pub fn register_tools() -> Vec<ToolDefinition> {
-    let requested_tools = std::env::var("CODEGRAPH_MCP_TOOLS")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(normalize_tool_name)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|names| !names.is_empty())
-        .unwrap_or_else(|| {
-            DEFAULT_TOOLS
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect()
-        });
+    canonical_tool_names()
+        .into_iter()
+        .filter_map(tool_by_short_name)
+        .collect()
+}
 
-    requested_tools
+fn canonical_tool_names() -> Vec<&'static str> {
+    let requested_tools = match std::env::var("CODEGRAPH_MCP_TOOLS") {
+        Ok(value) => value
+            .split(',')
+            .map(normalize_tool_name)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        Err(_) => return DEFAULT_TOOLS.to_vec(),
+    };
+
+    if requested_tools.is_empty() {
+        return DEFAULT_TOOLS.to_vec();
+    }
+
+    ALL_TOOLS
         .iter()
-        .filter_map(|name| tool_by_short_name(name.as_str()))
+        .copied()
+        .filter(|name| requested_tools.iter().any(|requested| requested == name))
         .collect()
 }
 
@@ -81,6 +95,10 @@ fn explore_tool() -> ToolDefinition {
                 "maxFiles": {
                     "type": "integer",
                     "description": "Maximum number of files to include"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec!["query".to_string()]),
@@ -104,6 +122,10 @@ fn node_tool() -> ToolDefinition {
                     "type": "string",
                     "description": "File path to read from the indexed project"
                 },
+                "line": {
+                    "type": "integer",
+                    "description": "One-based line number to inspect"
+                },
                 "offset": {
                     "type": "integer",
                     "description": "One-based starting line offset for file reads"
@@ -115,6 +137,14 @@ fn node_tool() -> ToolDefinition {
                 "symbolsOnly": {
                     "type": "boolean",
                     "description": "Return symbol summaries without source text"
+                },
+                "includeCode": {
+                    "type": "boolean",
+                    "description": "Include source code when returning symbol details"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec![]),
@@ -134,9 +164,17 @@ fn callers_tool() -> ToolDefinition {
                     "type": "string",
                     "description": "Function, method, or symbol to find callers for"
                 },
+                "file": {
+                    "type": "string",
+                    "description": "Optional file path to disambiguate the symbol"
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of callers to return"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec!["symbol".to_string()]),
@@ -156,9 +194,17 @@ fn callees_tool() -> ToolDefinition {
                     "type": "string",
                     "description": "Function, method, or symbol to find callees for"
                 },
+                "file": {
+                    "type": "string",
+                    "description": "Optional file path to disambiguate the symbol"
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of callees to return"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec!["symbol".to_string()]),
@@ -178,6 +224,10 @@ fn impact_tool() -> ToolDefinition {
                     "type": "string",
                     "description": "Function, method, or symbol to analyze"
                 },
+                "file": {
+                    "type": "string",
+                    "description": "Optional file path to disambiguate the symbol"
+                },
                 "depth": {
                     "type": "integer",
                     "description": "Maximum relationship depth to traverse"
@@ -185,6 +235,10 @@ fn impact_tool() -> ToolDefinition {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of impacted nodes to return"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec!["symbol".to_string()]),
@@ -207,6 +261,14 @@ fn search_tool() -> ToolDefinition {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of search results to return"
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional symbol kind filter"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec!["query".to_string()]),
@@ -239,9 +301,17 @@ fn files_tool() -> ToolDefinition {
                     "type": "integer",
                     "description": "Maximum directory depth for tree output"
                 },
+                "grouped": {
+                    "type": "boolean",
+                    "description": "Group files by directory or language when supported"
+                },
                 "noMetadata": {
                     "type": "boolean",
                     "description": "Omit language, size, and graph metadata"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec![]),
@@ -256,7 +326,12 @@ fn status_tool() -> ToolDefinition {
         description: "Show whether CodeGraph is initialized and summarize indexed graph metadata.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
-            properties: Some(json!({})),
+            properties: Some(json!({
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
+                }
+            })),
             required: Some(vec![]),
         },
     }

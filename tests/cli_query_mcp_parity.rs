@@ -524,3 +524,20 @@ fn mcp_tool_allowlist_accepts_short_names() {
         ]
     );
 }
+
+#[test]
+fn mcp_tool_allowlist_deduplicates_in_canonical_order() {
+    let names = {
+        let _guard = mcp_tools_env(Some("status,node,node,explore"));
+        let tools = codegraph::mcp::tools::register_tools();
+        tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names,
+        vec![
+            "codegraph_explore",
+            "codegraph_node",
+            "codegraph_status",
+        ]
+    );
+}
