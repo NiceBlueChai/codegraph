@@ -538,8 +538,8 @@ fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
             println!("{}", serde_json::json!({"initialized": false}));
             return Ok(());
         }
-        Err(_) => {
-            println!("CodeGraph not initialized");
+        Err(err) => {
+            println!("{}", err);
             return Ok(());
         }
     };

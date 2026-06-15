@@ -7,13 +7,17 @@ use std::path::{Path, PathBuf};
 
 use crate::db::{get_database_path, is_initialized, DatabaseConnection};
 
+/// Captures the initialized project root and database path chosen for a command.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
+    /// Directory that owns the discovered `.codegraph` database state.
     pub root: PathBuf,
+    /// SQLite database file associated with the discovered project root.
     pub db_path: PathBuf,
 }
 
 impl ProjectContext {
+    /// Opens the resolved database with context that identifies the failing file path.
     pub fn open_database(&self) -> anyhow::Result<DatabaseConnection> {
         DatabaseConnection::open(self.db_path.to_str().ok_or_else(|| {
             anyhow::anyhow!(
@@ -24,6 +28,7 @@ impl ProjectContext {
         .map_err(|e| anyhow::anyhow!("Failed to open database {}: {}", self.db_path.display(), e))
     }
 
+    /// Returns the project root as UTF-8 for APIs that still accept string paths.
     pub fn root_str(&self) -> anyhow::Result<&str> {
         self.root.to_str().ok_or_else(|| {
             anyhow::anyhow!("Project path is not valid UTF-8: {}", self.root.display())
@@ -31,6 +36,7 @@ impl ProjectContext {
     }
 }
 
+/// Resolves a command path to the nearest initialized CodeGraph project.
 pub fn resolve_project(path_arg: Option<&str>) -> anyhow::Result<ProjectContext> {
     let start = path_arg.unwrap_or(".");
     let start_path = Path::new(start);
@@ -69,6 +75,7 @@ pub fn resolve_project(path_arg: Option<&str>) -> anyhow::Result<ProjectContext>
     ))
 }
 
+/// Reports whether a command path can be associated with an initialized project.
 pub fn is_project_initialized(path_arg: Option<&str>) -> bool {
     resolve_project(path_arg).is_ok()
 }
