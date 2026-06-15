@@ -774,11 +774,13 @@ impl<'a> QueryBuilder<'a> {
     /// Get file-level dependents: files that depend on nodes in the given file
     pub fn get_file_dependents(&self, file_path: &str) -> Result<Vec<String>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT n2.file_path
+            "SELECT DISTINCT n1.file_path
              FROM edges e
              JOIN nodes n1 ON e.source = n1.id
              JOIN nodes n2 ON e.target = n2.id
-             WHERE n1.file_path = ?1 AND n1.file_path != n2.file_path"
+             WHERE n2.file_path = ?1
+               AND n1.file_path != n2.file_path
+               AND e.kind != 'contains'"
         )?;
         let rows = stmt.query_map(params![file_path], |row| row.get(0))?;
         rows.collect::<Result<Vec<String>, _>>()
@@ -927,5 +929,62 @@ mod tests {
         let incoming = queries.get_incoming_edges("node_b").unwrap();
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].source, "node_a");
+    }
+
+    #[test]
+    fn get_file_dependents_returns_files_that_depend_on_target_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = DatabaseConnection::initialize(db_path.to_str().unwrap()).unwrap();
+        initialize_schema(db.get_conn()).unwrap();
+
+        let queries = QueryBuilder::new(db.get_conn());
+        let node_a = Node::new(
+            "node_a".to_string(),
+            NodeKind::Function,
+            "funcA".to_string(),
+            "a.ts::funcA".to_string(),
+            "a.ts".to_string(),
+            Language::TypeScript,
+            1,
+            5,
+            0,
+            40,
+        );
+        let node_b = Node::new(
+            "node_b".to_string(),
+            NodeKind::Function,
+            "funcB".to_string(),
+            "b.ts::funcB".to_string(),
+            "b.ts".to_string(),
+            Language::TypeScript,
+            1,
+            5,
+            0,
+            40,
+        );
+
+        queries.insert_node(&node_a).unwrap();
+        queries.insert_node(&node_b).unwrap();
+        queries
+            .insert_edge(&Edge::new(
+                "node_a".to_string(),
+                "node_b".to_string(),
+                EdgeKind::Calls,
+            ))
+            .unwrap();
+        queries
+            .insert_edge(&Edge::new(
+                "node_b".to_string(),
+                "node_a".to_string(),
+                EdgeKind::Contains,
+            ))
+            .unwrap();
+
+        let b_dependents = queries.get_file_dependents("b.ts").unwrap();
+        assert!(b_dependents.contains(&"a.ts".to_string()));
+
+        let a_dependents = queries.get_file_dependents("a.ts").unwrap();
+        assert!(!a_dependents.contains(&"b.ts".to_string()));
     }
 }
