@@ -1,0 +1,854 @@
+use tree_sitter::{Parser, Node as TSTreeSitterNode};
+use crate::types::*;
+use log::debug;
+
+/// Tree-sitter based code parser providing accurate AST extraction
+pub struct TreeSitterParser {
+    parser: Parser,
+}
+
+impl TreeSitterParser {
+    pub fn new() -> Self {
+        Self {
+            parser: Parser::new(),
+        }
+    }
+
+    /// Parse source code using tree-sitter for the given language
+    pub fn parse(&mut self, file_path: &str, source: &str) -> ExtractionResult {
+        let mut result = ExtractionResult::new();
+        let lang = Language::from_extension(
+            std::path::Path::new(file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or(""),
+        )
+        .unwrap_or(Language::Unknown);
+
+        let ts_lang = match lang {
+            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Language::JavaScript => tree_sitter_typescript::LANGUAGE_TSX.into(), // Use TSX for JS
+            Language::Python => tree_sitter_python::LANGUAGE.into(),
+            Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+            _ => {
+                debug!("No tree-sitter grammar for {:?}, skipping AST parse", lang);
+                return result;
+            }
+        };
+
+        if self.parser.set_language(&ts_lang).is_err() {
+            debug!("Failed to set tree-sitter language for {:?}", lang);
+            return result;
+        }
+
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => {
+                debug!("Failed to parse {}", file_path);
+                return result;
+            }
+        };
+
+        let line_count = source.lines().count() as u32;
+
+        // Add file node
+        result.nodes.push(Node::new(
+            format!("{}::[file]", file_path),
+            NodeKind::File,
+            file_path.to_string(),
+            file_path.to_string(),
+            file_path.to_string(),
+            lang.clone(),
+            1,
+            line_count.max(1),
+            0,
+            0,
+        ));
+
+        let root = tree.root_node();
+        self.walk_node(root, source, file_path, &lang, &mut result);
+
+        debug!(
+            "Tree-sitter parsed {}: {} nodes, {} edges",
+            file_path,
+            result.nodes.len(),
+            result.edges.len()
+        );
+        result
+    }
+
+    /// Recursively walk AST nodes and extract code elements
+    fn walk_node(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let node_type = node.kind();
+
+        match node_type {
+            // Functions
+            "function_declaration" | "function_signature" => {
+                self.extract_function(node, source, file_path, lang, result);
+            }
+
+            // Arrow functions and function expressions assigned to variables
+            "lexical_declaration" | "variable_declaration" => {
+                self.extract_variable_decl(node, source, file_path, lang, result);
+            }
+
+            // Classes
+            "class_declaration" | "abstract_class_declaration" => {
+                self.extract_class(node, source, file_path, lang, result);
+            }
+
+            // Interfaces (TypeScript)
+            "interface_declaration" => {
+                self.extract_interface(node, source, file_path, lang, result);
+            }
+
+            // Type aliases (TypeScript)
+            "type_alias_declaration" => {
+                self.extract_type_alias(node, source, file_path, lang, result);
+            }
+
+            // Enums
+            "enum_declaration" => {
+                self.extract_enum(node, source, file_path, lang, result);
+            }
+
+            // Imports
+            "import_statement" => {
+                self.extract_import(node, source, file_path, lang, result);
+            }
+
+            // Method definitions inside classes
+            "method_definition" => {
+                self.extract_method(node, source, file_path, lang, result);
+            }
+
+            // Python-specific
+            "function_definition" | "decorated_definition" => {
+                if *lang == Language::Python {
+                    self.extract_python_function(node, source, file_path, result);
+                }
+            }
+            "class_definition" => {
+                if *lang == Language::Python {
+                    self.extract_python_class(node, source, file_path, result);
+                }
+            }
+
+            // Rust-specific
+            "function_item" => {
+                if *lang == Language::Rust {
+                    self.extract_rust_function(node, source, file_path, result);
+                }
+            }
+            "struct_item" => {
+                if *lang == Language::Rust {
+                    self.extract_rust_struct(node, source, file_path, result);
+                }
+            }
+            "impl_item" => {
+                if *lang == Language::Rust {
+                    self.extract_rust_impl(node, source, file_path, result);
+                }
+            }
+
+            // Call expressions (for call edges)
+            "call_expression" => {
+                self.extract_call(node, source, file_path, lang, result);
+            }
+
+            _ => {}
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.walk_node(child, source, file_path, lang, result);
+        }
+    }
+
+    fn extract_function(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let mut n = Node::new(
+            id,
+            NodeKind::Function,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            lang.clone(),
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        n.signature = Some(self.get_node_text(node, source));
+        n.is_async = self.has_modifier(node, "async");
+        n.is_exported = self.is_exported(node);
+        result.nodes.push(n);
+    }
+
+    fn extract_variable_decl(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        // Check if any declarator has an arrow function or function expression
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(value) = child.child_by_field_name("value") {
+                    if value.kind() == "arrow_function" || value.kind() == "function_expression" {
+                        let name = self
+                            .get_child_text(child, "name", source)
+                            .unwrap_or_default();
+                        if name.is_empty() {
+                            continue;
+                        }
+
+                        let start = node.start_position();
+                        let end = node.end_position();
+                        let qualified_name = format!("{}::{}", file_path, name);
+                        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+                        let n = Node::new(
+                            id,
+                            NodeKind::Function,
+                            name,
+                            qualified_name,
+                            file_path.to_string(),
+                            lang.clone(),
+                            (start.row + 1) as u32,
+                            (end.row + 1) as u32,
+                            start.column as u32,
+                            end.column as u32,
+                        );
+                        result.nodes.push(n);
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_class(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let mut n = Node::new(
+            id.clone(),
+            NodeKind::Class,
+            name.clone(),
+            qualified_name,
+            file_path.to_string(),
+            lang.clone(),
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        n.is_abstract = node.kind() == "abstract_class_declaration";
+        result.nodes.push(n);
+
+        // Extract extends relationship
+        if let Some(super_clause) = self.find_child(node, "class_heritage") {
+            if let Some(parent_name) = self.get_node_text_parts(super_clause, source).first() {
+                let parent_id = format!("{}::{}#0", file_path, parent_name);
+                result.edges.push(Edge::new(id.clone(), parent_id, EdgeKind::Extends));
+            }
+        }
+    }
+
+    fn extract_interface(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let n = Node::new(
+            id,
+            NodeKind::Interface,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            lang.clone(),
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        result.nodes.push(n);
+    }
+
+    fn extract_type_alias(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let n = Node::new(
+            id,
+            NodeKind::TypeAlias,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            lang.clone(),
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        result.nodes.push(n);
+    }
+
+    fn extract_enum(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let n = Node::new(
+            id,
+            NodeKind::Enum,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            lang.clone(),
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        result.nodes.push(n);
+    }
+
+    fn extract_import(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        // Extract import source
+        let source_text = self.get_child_text(node, "source", source);
+        if let Some(src) = source_text {
+            let clean_src = src.trim_matches(|c| c == '\'' || c == '"');
+            let uref = UnresolvedReference {
+                id: Some(0),
+                from_node_id: format!("{}::[file]", file_path),
+                reference_name: clean_src.to_string(),
+                reference_kind: "import".to_string(),
+                line: (node.start_position().row + 1) as u32,
+                col: node.start_position().column as u32,
+                candidates: None,
+                file_path: file_path.to_string(),
+                language: lang.as_str().to_string(),
+            };
+            result.unresolved_refs.push(uref);
+        }
+    }
+
+    fn extract_method(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let mut n = Node::new(
+            id,
+            NodeKind::Method,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            lang.clone(),
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        n.is_async = self.has_modifier(node, "async");
+        n.is_static = self.has_modifier(node, "static");
+        result.nodes.push(n);
+    }
+
+    fn extract_python_function(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let actual = if node.kind() == "decorated_definition" {
+            match self.find_child(node, "function_definition") {
+                Some(child) => child,
+                None => node,
+            }
+        } else {
+            node
+        };
+
+        let name = self.get_child_text(actual, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let mut n = Node::new(
+            id,
+            NodeKind::Function,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            Language::Python,
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        n.is_async = self.has_child(actual, "async");
+        result.nodes.push(n);
+    }
+
+    fn extract_python_class(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let actual = if node.kind() == "decorated_definition" {
+            match self.find_child(node, "class_definition") {
+                Some(child) => child,
+                None => node,
+            }
+        } else {
+            node
+        };
+
+        let name = self.get_child_text(actual, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let n = Node::new(
+            id,
+            NodeKind::Class,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            Language::Python,
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        result.nodes.push(n);
+    }
+
+    fn extract_rust_function(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let mut n = Node::new(
+            id,
+            NodeKind::Function,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            Language::Rust,
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        n.is_async = self.has_child_text(node, "async");
+        n.visibility = Some(if self.has_child_text(node, "pub") {
+            "public".to_string()
+        } else {
+            "private".to_string()
+        });
+        result.nodes.push(n);
+    }
+
+    fn extract_rust_struct(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let qualified_name = format!("{}::{}", file_path, name);
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+
+        let n = Node::new(
+            id,
+            NodeKind::Struct,
+            name,
+            qualified_name,
+            file_path.to_string(),
+            Language::Rust,
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        result.nodes.push(n);
+    }
+
+    fn extract_rust_impl(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        // Extract impl methods
+        if let Some(body) = self.find_child(node, "declaration_list") {
+            let mut cursor = body.walk();
+            for child in body.named_children(&mut cursor) {
+                if child.kind() == "function_item" {
+                    self.extract_rust_function(child, source, file_path, result);
+                }
+            }
+        }
+    }
+
+    fn extract_call(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        _lang: &Language,
+        result: &mut ExtractionResult,
+    ) {
+        let func_node = node.child_by_field_name("function");
+        if let Some(func) = func_node {
+            let callee = self.get_node_text(func, source);
+            if !callee.is_empty() {
+                // Try to find parent function
+                let caller_id = self.find_enclosing_function_id(node, file_path);
+                if let Some(caller) = caller_id {
+                    let callee_id = format!("{}::{}#0", file_path, callee);
+                    result.edges.push(Edge::new(caller, callee_id, EdgeKind::Calls));
+
+                    // Also create unresolved ref for resolution
+                    let uref = UnresolvedReference {
+                        id: Some(0),
+                        from_node_id: result
+                            .nodes
+                            .last()
+                            .map(|n| n.id.clone())
+                            .unwrap_or_default(),
+                        reference_name: callee,
+                        reference_kind: "call".to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        col: node.start_position().column as u32,
+                        candidates: None,
+                        file_path: file_path.to_string(),
+                        language: "unknown".to_string(),
+                    };
+                    result.unresolved_refs.push(uref);
+                }
+            }
+        }
+    }
+
+    // Helper: find enclosing function node and return its ID
+    fn find_enclosing_function_id(
+        &self,
+        node: TSTreeSitterNode,
+        file_path: &str,
+    ) -> Option<String> {
+        let mut current = node.parent()?;
+        loop {
+            match current.kind() {
+                "function_declaration" | "function_expression" | "arrow_function"
+                | "method_definition" | "function_item" | "function_definition" => {
+                    let name = self
+                        .get_child_text(current, "name", "")
+                        .unwrap_or_else(|| "anonymous".to_string());
+                    let start = current.start_position();
+                    return Some(format!("{}::{}#{}", file_path, name, start.row + 1));
+                }
+                _ => {
+                    current = current.parent()?;
+                }
+            }
+        }
+    }
+
+    // Helper: get child node text by field name
+    fn get_child_text(&self, node: TSTreeSitterNode, field: &str, source: &str) -> Option<String> {
+        if source.is_empty() {
+            return None;
+        }
+        node.child_by_field_name(field)
+            .and_then(|c| {
+                let start = c.start_byte();
+                let end = c.end_byte();
+                if start >= source.len() || end > source.len() || start > end {
+                    return None;
+                }
+                c.utf8_text(source.as_bytes()).ok()
+            })
+            .map(|s| s.to_string())
+    }
+
+    // Helper: get full node text
+    fn get_node_text(&self, node: TSTreeSitterNode, source: &str) -> String {
+        let start = node.start_byte();
+        let end = node.end_byte();
+        if start >= source.len() || end > source.len() || start > end {
+            return String::new();
+        }
+        node.utf8_text(source.as_bytes())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    // Helper: get text parts of a node (split by whitespace)
+    fn get_node_text_parts(&self, node: TSTreeSitterNode, source: &str) -> Vec<String> {
+        self.get_node_text(node, source)
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    // Helper: find first child of a given type
+    fn find_child<'a>(&self, node: TSTreeSitterNode<'a>, kind: &str) -> Option<TSTreeSitterNode<'a>> {
+        let mut cursor = node.walk();
+        let result = node.named_children(&mut cursor).find(|c| c.kind() == kind);
+        result
+    }
+
+    // Helper: check if node has a child of given type
+    fn has_child(&self, node: TSTreeSitterNode, kind: &str) -> bool {
+        self.find_child(node, kind).is_some()
+    }
+
+    // Helper: check if node has a child with specific text
+    fn has_child_text(&self, node: TSTreeSitterNode, text: &str) -> bool {
+        let mut cursor = node.walk();
+        let result = node.children(&mut cursor)
+            .any(|c| c.kind() == text);
+        result
+    }
+
+    // Helper: check if node has a modifier
+    fn has_modifier(&self, node: TSTreeSitterNode, modifier: &str) -> bool {
+        let mut cursor = node.walk();
+        let result = node.children(&mut cursor).any(|c| c.kind() == modifier);
+        result
+    }
+
+    // Helper: check if node is exported
+    fn is_exported(&self, node: TSTreeSitterNode) -> bool {
+        // Check for "export" keyword before the node
+        if let Some(prev) = node.prev_named_sibling() {
+            prev.kind() == "export_statement"
+        } else {
+            // Check parent
+            if let Some(parent) = node.parent() {
+                parent.kind() == "export_statement"
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_typescript() {
+        let mut parser = TreeSitterParser::new();
+        let source = r#"export function hello() {
+    console.log("hello");
+}
+
+export class Foo {
+    bar() {
+        return 42;
+    }
+}
+
+interface Baz {
+    name: string;
+}
+
+type Qux = string | number;
+
+enum Color {
+    Red,
+    Green,
+}
+"#;
+        let result = parser.parse("test.ts", source);
+
+        // Should have file + hello + Foo + bar + Baz + Qux + Color
+        let node_names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(node_names.contains(&"hello"), "Should find function hello, got {:?}", node_names);
+        assert!(node_names.contains(&"Foo"), "Should find class Foo, got {:?}", node_names);
+        assert!(node_names.contains(&"Baz"), "Should find interface Baz, got {:?}", node_names);
+        assert!(node_names.contains(&"Qux"), "Should find type Qux, got {:?}", node_names);
+        assert!(node_names.contains(&"Color"), "Should find enum Color, got {:?}", node_names);
+    }
+
+    #[test]
+    fn test_parse_python() {
+        let mut parser = TreeSitterParser::new();
+        let source = r#"
+def hello():
+    print("hello")
+
+class Foo:
+    def bar(self):
+        return 42
+"#;
+        let result = parser.parse("test.py", source);
+        let node_names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(node_names.contains(&"hello"), "Should find function hello, got {:?}", node_names);
+        assert!(node_names.contains(&"Foo"), "Should find class Foo, got {:?}", node_names);
+    }
+
+    #[test]
+    fn test_parse_rust() {
+        let mut parser = TreeSitterParser::new();
+        let source = r#"
+pub fn hello() {
+    println!("hello");
+}
+
+struct Foo {
+    name: String,
+}
+
+impl Foo {
+    fn bar(&self) -> i32 {
+        42
+    }
+}
+"#;
+        let result = parser.parse("test.rs", source);
+        let node_names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(node_names.contains(&"hello"), "Should find function hello, got {:?}", node_names);
+        assert!(node_names.contains(&"Foo"), "Should find struct Foo, got {:?}", node_names);
+    }
+}
