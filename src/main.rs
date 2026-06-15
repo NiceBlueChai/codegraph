@@ -694,6 +694,7 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
             codegraph::query_service::QueryService::render_graph_list(
                 &format!("Callers of '{}'", symbol),
                 &visible_callers,
+                callers.len(),
             )
         );
     }
@@ -730,6 +731,7 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
             codegraph::query_service::QueryService::render_graph_list(
                 &format!("Callees of '{}'", symbol),
                 &visible_callees,
+                callees.len(),
             )
         );
     }

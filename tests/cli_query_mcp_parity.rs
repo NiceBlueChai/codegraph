@@ -64,6 +64,63 @@ export function workerMain(name: string) {
     dir
 }
 
+fn fixture_project_with_two_helper_callers() -> TempDir {
+    let dir = fixture_project();
+    let project = codegraph::project::resolve_project(Some(
+        dir.path().to_str().expect("temp path is utf-8"),
+    ))
+    .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+    let options = codegraph::types::SearchOptions {
+        limit: 10,
+        kinds: None,
+        file_pattern: None,
+    };
+    let helper = queries
+        .search_nodes("helper", Some(&options))
+        .expect("search helper")
+        .into_iter()
+        .find(|result| result.node.name == "helper")
+        .expect("helper node")
+        .node;
+    let caller_one = codegraph::types::Node::new(
+        "app.ts::caller_one".to_string(),
+        codegraph::types::NodeKind::Function,
+        "callerOne".to_string(),
+        "app.ts::callerOne".to_string(),
+        "app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        20,
+        22,
+        1,
+        20,
+    );
+    let caller_two = codegraph::types::Node::new(
+        "app.ts::caller_two".to_string(),
+        codegraph::types::NodeKind::Function,
+        "callerTwo".to_string(),
+        "app.ts::callerTwo".to_string(),
+        "app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        30,
+        32,
+        1,
+        20,
+    );
+    for caller in [&caller_two, &caller_one] {
+        queries.insert_node(caller).expect("insert caller");
+        queries
+            .insert_edge(&codegraph::types::Edge::new(
+                caller.id.clone(),
+                helper.id.clone(),
+                codegraph::types::EdgeKind::Calls,
+            ))
+            .expect("insert caller edge");
+    }
+    dir
+}
+
 fn many_matching_functions_then_class_project() -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     let init = run_codegraph(&["init", "--verbose"], dir.path());
@@ -273,7 +330,8 @@ fn query_service_graph_methods_return_shared_relationship_results() {
     let callers = service.callers("target", 10).expect("callers");
     let callees = service.callees("target", 10).expect("callees");
     let impact = service.impact_nodes("target", 3).expect("impact");
-    let rendered = codegraph::query_service::QueryService::render_graph_list("Callees", &callees);
+    let rendered =
+        codegraph::query_service::QueryService::render_graph_list("Callees", &callees, callees.len());
     let caller_names = callers.iter().map(|(node, _)| &node.name).collect::<Vec<_>>();
     let callee_names = callees.iter().map(|(node, _)| &node.name).collect::<Vec<_>>();
     let impact_names = impact.iter().map(|node| &node.name).collect::<Vec<_>>();
@@ -289,60 +347,7 @@ fn query_service_graph_methods_return_shared_relationship_results() {
 
 #[test]
 fn callers_json_limit_does_not_change_total() {
-    let dir = fixture_project();
-    let project = codegraph::project::resolve_project(Some(
-        dir.path().to_str().expect("temp path is utf-8"),
-    ))
-    .expect("resolve project");
-    let db = project.open_database().expect("open database");
-    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
-    let options = codegraph::types::SearchOptions {
-        limit: 10,
-        kinds: None,
-        file_pattern: None,
-    };
-    let helper = queries
-        .search_nodes("helper", Some(&options))
-        .expect("search helper")
-        .into_iter()
-        .find(|result| result.node.name == "helper")
-        .expect("helper node")
-        .node;
-    let caller_one = codegraph::types::Node::new(
-        "app.ts::caller_one".to_string(),
-        codegraph::types::NodeKind::Function,
-        "callerOne".to_string(),
-        "app.ts::callerOne".to_string(),
-        "app.ts".to_string(),
-        codegraph::types::Language::TypeScript,
-        20,
-        22,
-        1,
-        20,
-    );
-    let caller_two = codegraph::types::Node::new(
-        "app.ts::caller_two".to_string(),
-        codegraph::types::NodeKind::Function,
-        "callerTwo".to_string(),
-        "app.ts::callerTwo".to_string(),
-        "app.ts".to_string(),
-        codegraph::types::Language::TypeScript,
-        30,
-        32,
-        1,
-        20,
-    );
-    for caller in [&caller_two, &caller_one] {
-        queries.insert_node(caller).expect("insert caller");
-        queries
-            .insert_edge(&codegraph::types::Edge::new(
-                caller.id.clone(),
-                helper.id.clone(),
-                codegraph::types::EdgeKind::Calls,
-            ))
-            .expect("insert caller edge");
-    }
-
+    let dir = fixture_project_with_two_helper_callers();
     let output = run_codegraph(
         &["callers", "helper", "--limit", "1", "--json"],
         dir.path(),
@@ -358,6 +363,22 @@ fn callers_json_limit_does_not_change_total() {
         value["total"].as_u64().unwrap_or(0) >= 2,
         "expected total to preserve full caller count:\n{value}"
     );
+}
+
+#[test]
+fn callers_text_limit_does_not_change_header_total() {
+    let dir = fixture_project_with_two_helper_callers();
+    let output = run_codegraph(&["callers", "helper", "--limit", "1"], dir.path());
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    let caller_rows = out.lines().filter(|line| line.starts_with("- ")).count();
+
+    assert!(
+        out.contains("Callers of 'helper' (2):"),
+        "expected header to show full caller count:\n{out}"
+    );
+    assert_eq!(caller_rows, 1, "expected limit to apply to visible rows:\n{out}");
+    assert!(out.contains("callerOne"), "expected stable first caller:\n{out}");
 }
 
 #[test]

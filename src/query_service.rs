@@ -408,12 +408,12 @@ impl<'a> QueryService<'a> {
         Ok(out)
     }
 
-    /// Renders graph relationship rows in a concise deterministic text format.
-    pub fn render_graph_list(title: &str, items: &[(Node, Edge)]) -> String {
-        if items.is_empty() {
+    /// Renders visible graph relationship rows with the full unbounded total.
+    pub fn render_graph_list(title: &str, items: &[(Node, Edge)], total: usize) -> String {
+        if total == 0 {
             return format!("{}: none\n", title);
         }
-        let mut out = format!("{} ({}):\n", title, items.len());
+        let mut out = format!("{} ({}):\n", title, total);
         for (node, edge) in items {
             out.push_str(&format!(
                 "- {} ({}) at {}:{} via {}\n",
