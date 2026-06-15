@@ -1,15 +1,16 @@
 //! MCP server request dispatcher for stdio JSON-RPC clients.
 
-use serde_json::{json, Value};
-use log::{info, debug};
 use crate::db::QueryBuilder;
-use crate::mcp::transport::{Transport, StdioTransport};
 use crate::mcp::protocol::*;
 use crate::mcp::tools;
+use crate::mcp::transport::{StdioTransport, Transport};
+use log::{debug, info};
+use serde_json::{json, Value};
 
 /// MCP Server implementation
 pub struct MCPServer<'a> {
     transport: Box<dyn Transport>,
+    project: Option<crate::project::ProjectContext>,
     queries: Option<QueryBuilder<'a>>,
 }
 
@@ -17,6 +18,7 @@ impl<'a> MCPServer<'a> {
     pub fn new() -> Self {
         Self {
             transport: Box::new(StdioTransport::new()),
+            project: None,
             queries: None,
         }
     }
@@ -25,8 +27,15 @@ impl<'a> MCPServer<'a> {
     pub fn with_transport(transport: Box<dyn Transport>) -> Self {
         Self {
             transport,
+            project: None,
             queries: None,
         }
+    }
+
+    /// Initialize server with the resolved project context.
+    pub fn with_project(mut self, project: crate::project::ProjectContext) -> Self {
+        self.project = Some(project);
+        self
     }
 
     /// Initialize server with database connection
@@ -102,7 +111,9 @@ impl<'a> MCPServer<'a> {
                 name: "CodeGraph".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
-            instructions: Some(crate::mcp::tools::server_instructions(self.queries.is_some())),
+            instructions: Some(crate::mcp::tools::server_instructions(
+                self.queries.is_some(),
+            )),
         };
 
         JsonRpcResponse {
@@ -115,11 +126,13 @@ impl<'a> MCPServer<'a> {
 
     /// Handle tools/list request
     fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
-        let tools_list = tools::register_tools();
-
-        let result = ListToolsResult {
-            tools: tools_list,
+        let tools_list = if self.queries.is_some() && self.project.is_some() {
+            tools::register_tools()
+        } else {
+            Vec::new()
         };
+
+        let result = ListToolsResult { tools: tools_list };
 
         JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
@@ -163,45 +176,43 @@ impl<'a> MCPServer<'a> {
             }
         };
 
-        // Get queries instance
-        let queries = match &self.queries {
-            Some(q) => q,
+        let project = match &self.project {
+            Some(project) => project,
             None => {
-                return JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
+                return tool_error_response(
                     id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32603,
-                        message: "Server not initialized with database".to_string(),
-                        data: None,
-                    }),
-                };
+                    "CodeGraph is inactive. Run `codegraph init -i` first.".to_string(),
+                );
             }
         };
 
-        // Execute tool
-        match tools::execute_tool(&call_params.name, call_params.arguments, queries) {
-            Ok(result) => {
-                JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
+        let queries = match &self.queries {
+            Some(q) => q,
+            None => {
+                return tool_error_response(
                     id,
-                    result: Some(serde_json::to_value(result).unwrap()),
-                    error: None,
-                }
+                    "CodeGraph is inactive. Run `codegraph init -i` first.".to_string(),
+                );
             }
-            Err(e) => {
-                JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32603,
-                        message: format!("Tool execution failed: {}", e),
-                        data: None,
-                    }),
-                }
-            }
+        };
+
+        match tools::execute_tool(&call_params.name, call_params.arguments, project, queries) {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(serde_json::to_value(result).unwrap()),
+                error: None,
+            },
+            Err(e) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: format!("Tool execution failed: {}", e),
+                    data: None,
+                }),
+            },
         }
     }
 
@@ -213,6 +224,24 @@ impl<'a> MCPServer<'a> {
             result: Some(json!({})),
             error: None,
         }
+    }
+}
+
+fn tool_error_response(id: Option<Value>, text: String) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: Some(
+            serde_json::to_value(CallToolResult {
+                content: vec![ContentBlock {
+                    content_type: "text".to_string(),
+                    text,
+                }],
+                is_error: Some(true),
+            })
+            .unwrap(),
+        ),
+        error: None,
     }
 }
 

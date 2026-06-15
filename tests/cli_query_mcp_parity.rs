@@ -103,10 +103,9 @@ export function workerMain(name: string) {
 
 fn fixture_project_with_two_helper_callers() -> TempDir {
     let dir = fixture_project();
-    let project = codegraph::project::resolve_project(Some(
-        dir.path().to_str().expect("temp path is utf-8"),
-    ))
-    .expect("resolve project");
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
     let db = project.open_database().expect("open database");
     let queries = codegraph::db::QueryBuilder::new(db.get_conn());
     let options = codegraph::types::SearchOptions {
@@ -167,10 +166,9 @@ fn many_matching_functions_then_class_project() -> TempDir {
         stdout(&init),
         stderr(&init)
     );
-    let project = codegraph::project::resolve_project(Some(
-        dir.path().to_str().expect("temp path is utf-8"),
-    ))
-    .expect("resolve project");
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
     let db = project.open_database().expect("open database");
     let queries = codegraph::db::QueryBuilder::new(db.get_conn());
     for i in 0..80 {
@@ -204,6 +202,15 @@ fn many_matching_functions_then_class_project() -> TempDir {
     dir
 }
 
+fn mcp_text(result: &codegraph::mcp::protocol::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn status_json_is_machine_readable_from_subdirectory() {
     let dir = fixture_project();
@@ -222,14 +229,7 @@ fn node_file_mode_reads_indexed_file_with_line_numbers() {
     let dir = fixture_project();
     let output = run_codegraph(
         &[
-            "node",
-            "app.ts",
-            "--file",
-            "app.ts",
-            "--offset",
-            "2",
-            "--limit",
-            "4",
+            "node", "app.ts", "--file", "app.ts", "--offset", "2", "--limit", "4",
         ],
         dir.path(),
     );
@@ -282,10 +282,9 @@ fn files_json_no_metadata_omits_metadata_fields() {
 #[test]
 fn query_service_filters_search_results_by_kind() {
     let dir = fixture_project();
-    let project = codegraph::project::resolve_project(Some(
-        dir.path().to_str().expect("temp path is utf-8"),
-    ))
-    .expect("resolve project");
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
     let db = project.open_database().expect("open database");
     let service = codegraph::query_service::QueryService::new(
         project,
@@ -303,10 +302,9 @@ fn query_service_filters_search_results_by_kind() {
 #[test]
 fn query_service_graph_methods_return_shared_relationship_results() {
     let dir = fixture_project();
-    let project = codegraph::project::resolve_project(Some(
-        dir.path().to_str().expect("temp path is utf-8"),
-    ))
-    .expect("resolve project");
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
     let db = project.open_database().expect("open database");
     let queries = codegraph::db::QueryBuilder::new(db.get_conn());
     let caller = codegraph::types::Node::new(
@@ -367,10 +365,19 @@ fn query_service_graph_methods_return_shared_relationship_results() {
     let callers = service.callers("target", 10).expect("callers");
     let callees = service.callees("target", 10).expect("callees");
     let impact = service.impact_nodes("target", 3).expect("impact");
-    let rendered =
-        codegraph::query_service::QueryService::render_graph_list("Callees", &callees, callees.len());
-    let caller_names = callers.iter().map(|(node, _)| &node.name).collect::<Vec<_>>();
-    let callee_names = callees.iter().map(|(node, _)| &node.name).collect::<Vec<_>>();
+    let rendered = codegraph::query_service::QueryService::render_graph_list(
+        "Callees",
+        &callees,
+        callees.len(),
+    );
+    let caller_names = callers
+        .iter()
+        .map(|(node, _)| &node.name)
+        .collect::<Vec<_>>();
+    let callee_names = callees
+        .iter()
+        .map(|(node, _)| &node.name)
+        .collect::<Vec<_>>();
     let impact_names = impact.iter().map(|node| &node.name).collect::<Vec<_>>();
 
     assert_eq!(caller_names, vec![&caller.name]);
@@ -385,16 +392,17 @@ fn query_service_graph_methods_return_shared_relationship_results() {
 #[test]
 fn callers_json_limit_does_not_change_total() {
     let dir = fixture_project_with_two_helper_callers();
-    let output = run_codegraph(
-        &["callers", "helper", "--limit", "1", "--json"],
-        dir.path(),
-    );
+    let output = run_codegraph(&["callers", "helper", "--limit", "1", "--json"], dir.path());
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let value: serde_json::Value =
         serde_json::from_str(&stdout(&output)).expect("callers stdout is json");
     let callers = value["callers"].as_array().expect("callers array");
 
-    assert_eq!(callers.len(), 1, "expected limit to apply to emitted callers:\n{value}");
+    assert_eq!(
+        callers.len(),
+        1,
+        "expected limit to apply to emitted callers:\n{value}"
+    );
     assert_eq!(callers[0]["name"], "callerOne");
     assert!(
         value["total"].as_u64().unwrap_or(0) >= 2,
@@ -414,8 +422,14 @@ fn callers_text_limit_does_not_change_header_total() {
         out.contains("Callers of 'helper' (2):"),
         "expected header to show full caller count:\n{out}"
     );
-    assert_eq!(caller_rows, 1, "expected limit to apply to visible rows:\n{out}");
-    assert!(out.contains("callerOne"), "expected stable first caller:\n{out}");
+    assert_eq!(
+        caller_rows, 1,
+        "expected limit to apply to visible rows:\n{out}"
+    );
+    assert!(
+        out.contains("callerOne"),
+        "expected stable first caller:\n{out}"
+    );
 }
 
 #[test]
@@ -436,7 +450,15 @@ fn impact_json_includes_edge_count() {
 fn query_kind_filter_is_applied_before_limit() {
     let dir = many_matching_functions_then_class_project();
     let output = run_codegraph(
-        &["query", "SearchTarget", "--kind", "class", "--limit", "1", "--json"],
+        &[
+            "query",
+            "SearchTarget",
+            "--kind",
+            "class",
+            "--limit",
+            "1",
+            "--json",
+        ],
         dir.path(),
     );
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
@@ -451,26 +473,32 @@ fn query_kind_filter_is_applied_before_limit() {
 #[test]
 fn query_invalid_kind_returns_empty_json_results() {
     let dir = fixture_project();
-    let output = run_codegraph(
-        &["query", "helper", "--kind", "typo", "--json"],
-        dir.path(),
-    );
+    let output = run_codegraph(&["query", "helper", "--kind", "typo", "--json"], dir.path());
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let value: serde_json::Value =
         serde_json::from_str(&stdout(&output)).expect("query stdout is json");
     let results = value["results"].as_array().expect("results array");
 
-    assert!(results.is_empty(), "invalid kind returned results:\n{value}");
+    assert!(
+        results.is_empty(),
+        "invalid kind returned results:\n{value}"
+    );
     assert_eq!(value["total"], 0);
 }
 
 #[test]
 fn explore_returns_source_without_prior_query() {
     let dir = fixture_project();
-    let output = run_codegraph(&["explore", "runApp helper", "--max-files", "2"], dir.path());
+    let output = run_codegraph(
+        &["explore", "runApp helper", "--max-files", "2"],
+        dir.path(),
+    );
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains("### Sources"), "expected sources section:\n{out}");
+    assert!(
+        out.contains("### Sources"),
+        "expected sources section:\n{out}"
+    );
     assert!(out.contains("runApp"), "expected matching symbol:\n{out}");
     assert!(out.contains("helper"), "expected related symbol:\n{out}");
 }
@@ -517,11 +545,7 @@ fn mcp_tool_allowlist_accepts_short_names() {
     };
     assert_eq!(
         names,
-        vec![
-            "codegraph_explore",
-            "codegraph_node",
-            "codegraph_status",
-        ]
+        vec!["codegraph_explore", "codegraph_node", "codegraph_status",]
     );
 }
 
@@ -534,10 +558,139 @@ fn mcp_tool_allowlist_deduplicates_in_canonical_order() {
     };
     assert_eq!(
         names,
-        vec![
-            "codegraph_explore",
-            "codegraph_node",
-            "codegraph_status",
-        ]
+        vec!["codegraph_explore", "codegraph_node", "codegraph_status",]
+    );
+}
+
+#[test]
+fn mcp_default_tools_use_query_service_handlers() {
+    let _guard = mcp_tools_env(None);
+    let dir = fixture_project();
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let node = codegraph::mcp::tools::execute_tool(
+        "codegraph_node",
+        Some(serde_json::json!({"file": "app.ts", "offset": 2, "limit": 3})),
+        &project,
+        &queries,
+    )
+    .expect("node tool");
+    let search = codegraph::mcp::tools::execute_tool(
+        "codegraph_search",
+        Some(serde_json::json!({"query": "helper", "kind": "function", "limit": 5})),
+        &project,
+        &queries,
+    )
+    .expect("search tool");
+    let callers = codegraph::mcp::tools::execute_tool(
+        "codegraph_callers",
+        Some(serde_json::json!({"symbol": "helper", "limit": 5})),
+        &project,
+        &queries,
+    )
+    .expect("callers tool");
+
+    let node_text = mcp_text(&node);
+    let search_text = mcp_text(&search);
+    let callers_text = mcp_text(&callers);
+
+    assert_ne!(node.is_error, Some(true), "node failed:\n{node_text}");
+    assert_ne!(search.is_error, Some(true), "search failed:\n{search_text}");
+    assert_ne!(
+        callers.is_error,
+        Some(true),
+        "callers failed:\n{callers_text}"
+    );
+    assert!(
+        node_text.contains("2\t"),
+        "expected line numbers:\n{node_text}"
+    );
+    assert!(
+        node_text.contains("helper"),
+        "expected file content:\n{node_text}"
+    );
+    assert!(
+        search_text.contains("\"name\": \"helper\""),
+        "expected JSON search result:\n{search_text}"
+    );
+    assert!(
+        callers_text.contains("Callers of 'helper'"),
+        "expected shared graph renderer:\n{callers_text}"
+    );
+}
+
+#[test]
+fn mcp_allowlisted_status_and_files_are_service_backed() {
+    let _guard = mcp_tools_env(Some("status,files"));
+    let dir = fixture_project();
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let status = codegraph::mcp::tools::execute_tool(
+        "codegraph_status",
+        Some(serde_json::json!({})),
+        &project,
+        &queries,
+    )
+    .expect("status tool");
+    let files = codegraph::mcp::tools::execute_tool(
+        "codegraph_files",
+        Some(serde_json::json!({"noMetadata": true})),
+        &project,
+        &queries,
+    )
+    .expect("files tool");
+
+    let status_json: serde_json::Value =
+        serde_json::from_str(&mcp_text(&status)).expect("status tool returns json");
+    let files_json: serde_json::Value =
+        serde_json::from_str(&mcp_text(&files)).expect("files tool returns json");
+    let app = files_json["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .find(|file| file["path"] == "app.ts")
+        .expect("app.ts entry");
+
+    assert_ne!(status.is_error, Some(true));
+    assert_ne!(files.is_error, Some(true));
+    assert_eq!(status_json["initialized"], true);
+    assert!(status_json["files"].as_u64().unwrap_or(0) >= 2);
+    assert!(
+        app.get("language").is_none(),
+        "metadata should be omitted:\n{app}"
+    );
+}
+
+#[test]
+fn mcp_non_default_tool_is_disabled_without_allowlist() {
+    let _guard = mcp_tools_env(None);
+    let dir = fixture_project();
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let result = codegraph::mcp::tools::execute_tool(
+        "codegraph_files",
+        Some(serde_json::json!({})),
+        &project,
+        &queries,
+    )
+    .expect("disabled tool result");
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        mcp_text(&result).contains("disabled via CODEGRAPH_MCP_TOOLS"),
+        "unexpected disabled message:\n{}",
+        mcp_text(&result)
     );
 }

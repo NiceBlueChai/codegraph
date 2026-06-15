@@ -638,21 +638,21 @@ fn cmd_query(path: &str, query: &str, limit: usize, kind: Option<&str>, json: bo
 }
 
 fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-
     if mcp {
-        // Use specified path or current directory
-        let project_root = path.unwrap_or(".");
-
-        if !codegraph::db::is_initialized(project_root) {
-            anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
-        }
-
-        let db_path = get_database_path(project_root);
-        let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+        let project = match codegraph::project::resolve_project(path) {
+            Ok(project) => project,
+            Err(_) => {
+                let mut server = codegraph::mcp::server::MCPServer::new();
+                server.run().map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+                return Ok(());
+            }
+        };
+        let db = project.open_database()?;
         let queries = QueryBuilder::new(db.get_conn());
 
-        let mut server = codegraph::mcp::server::MCPServer::new().with_queries(queries);
+        let mut server = codegraph::mcp::server::MCPServer::new()
+            .with_project(project)
+            .with_queries(queries);
         server.run().map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
     } else {
         println!("Starting MCP server...");
