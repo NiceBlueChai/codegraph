@@ -418,7 +418,7 @@ fn cmd_init(path: &str, verbose: bool) -> anyhow::Result<()> {
     use codegraph::db::{get_database_path, create_directory};
 
     if verbose {
-        log::info!("Initializing CodeGraph at {} (verbose)", path);
+        eprintln!("  Initializing at {}...", path);
     }
 
     create_directory(path)?;
@@ -449,10 +449,6 @@ fn cmd_index(path: &str, force: bool, quiet: bool, verbose: bool) -> anyhow::Res
         anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
     }
 
-    if verbose {
-        log::info!("Indexing at {} (force={}, verbose)", path, force);
-    }
-
     let db_path = get_database_path(path);
     let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
     initialize_schema(db.get_conn())?;
@@ -479,6 +475,27 @@ fn cmd_index(path: &str, force: bool, quiet: bool, verbose: bool) -> anyhow::Res
         println!("  Files skipped: {}", result.files_skipped);
         println!("  Nodes created: {}", result.nodes_created);
         println!("  Edges created: {}", result.edges_created);
+    }
+
+    // Verbose: show detailed per-file error info and timing
+    if verbose && !result.errors.is_empty() {
+        eprintln!("\n  Errors ({}):", result.errors.len());
+        for err in &result.errors {
+            if let Some(ref file) = err.file_path {
+                eprintln!("    [{}] {}: {}", err.severity, file, err.message);
+            } else {
+                eprintln!("    [{}] {}", err.severity, err.message);
+            }
+        }
+    }
+    if verbose {
+        let parsed = result.files_indexed + result.files_errored;
+        let rate = if result.duration_ms > 0 {
+            (parsed as f64) / (result.duration_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        eprintln!("  Duration: {}ms ({:.1} files/s)", result.duration_ms, rate);
     }
 
     Ok(())
