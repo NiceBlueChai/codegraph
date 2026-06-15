@@ -1140,7 +1140,6 @@ fn build_file_tree(
 fn cmd_explore(path: &str, query: &[String], max_files: usize) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
     use codegraph::core::query::GraphTraverser;
-    use std::fs;
 
     if !codegraph::db::is_initialized(path) {
         anyhow::bail!("CodeGraph not initialized");
@@ -1194,7 +1193,7 @@ fn cmd_explore(path: &str, query: &[String], max_files: usize) -> anyhow::Result
 
         // Try to read source
         let full_path = std::path::Path::new(path).join(&node.file_path);
-        if let Ok(content) = fs::read_to_string(&full_path) {
+        if let Ok(content) = codegraph::util::read_file_content(&full_path) {
             let lines: Vec<&str> = content.lines().collect();
             let start = (node.start_line as usize).saturating_sub(2);
             let end = (node.end_line as usize + 2).min(lines.len());
@@ -1222,7 +1221,6 @@ fn cmd_node(
     symbols_only: bool,
 ) -> anyhow::Result<()> {
     use codegraph::db::get_database_path;
-    use std::fs;
     use std::path::Path;
 
     if !codegraph::db::is_initialized(path) {
@@ -1236,7 +1234,7 @@ fn cmd_node(
     // File mode
     if let Some(file_path) = file {
         let full_path = Path::new(path).join(file_path);
-        let content = fs::read_to_string(&full_path)?;
+        let content = codegraph::util::read_file_content(&full_path)?;
         let lines: Vec<&str> = content.lines().collect();
 
         let start = offset.unwrap_or(1).saturating_sub(1);
@@ -1280,7 +1278,7 @@ fn cmd_node(
 
     // Read source
     let full_path = Path::new(path).join(&node.file_path);
-    if let Ok(content) = fs::read_to_string(&full_path) {
+    if let Ok(content) = codegraph::util::read_file_content(&full_path) {
         let lines: Vec<&str> = content.lines().collect();
         let start = (node.start_line as usize).saturating_sub(1);
         let end = (node.end_line as usize).min(lines.len());

@@ -4,6 +4,7 @@ pub mod core;
 pub mod extraction;
 pub mod sync;
 pub mod mcp;
+pub mod util;
 
 // Re-export main types
 pub use types::*;

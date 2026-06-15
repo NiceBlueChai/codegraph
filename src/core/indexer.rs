@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::fs;
 use log::info;
 use sha2::{Sha256, Digest};
 use ignore::WalkBuilder;
@@ -53,7 +52,7 @@ impl<'a> Indexer<'a> {
             };
 
             // Quick hash check to skip unchanged files
-            match fs::read_to_string(file_path) {
+            match crate::util::read_file_content(file_path) {
                 Ok(content) => {
                     let hash = self.hash_content(&content);
                     if let Some(existing) = self.queries.get_file_by_path(&rel_path)? {
@@ -83,7 +82,7 @@ impl<'a> Indexer<'a> {
         let parsed_files: Vec<ParsedFile> = files_to_parse
             .par_iter()
             .map(|(file_path, rel_path)| {
-                let content = match fs::read_to_string(file_path) {
+                let content = match crate::util::read_file_content(file_path) {
                     Ok(c) => c,
                     Err(e) => {
                         return ParsedFile {
@@ -232,7 +231,7 @@ impl<'a> Indexer<'a> {
             let rel_path = self.make_relative(file_path)?;
             result.files_checked += 1;
 
-            let content = match fs::read_to_string(file_path) {
+            let content = match crate::util::read_file_content(file_path) {
                 Ok(c) => c,
                 Err(e) => {
                     info!("Failed to read {}: {}", file_path.display(), e);
@@ -343,7 +342,7 @@ impl<'a> Indexer<'a> {
                 continue;
             }
 
-            let content = match fs::read_to_string(&full_path) {
+            let content = match crate::util::read_file_content(&full_path) {
                 Ok(c) => c,
                 Err(e) => {
                     info!("Failed to read {}: {}", full_path.display(), e);
