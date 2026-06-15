@@ -339,7 +339,7 @@ impl<'a> QueryService<'a> {
         Ok(out)
     }
 
-    /// Finds callers of matching symbols without wiring CLI graph commands yet.
+    /// Finds callers of matching symbols with duplicate caller nodes removed.
     pub fn callers(&self, symbol: &str, limit: usize) -> anyhow::Result<Vec<(Node, Edge)>> {
         let matches = self.exact_symbol_matches(symbol, 50)?;
         let traverser = GraphTraverser::new(QueryBuilder::new(self.queries.get_conn()));
@@ -357,6 +357,67 @@ impl<'a> QueryService<'a> {
         }
         out.truncate(limit);
         Ok(out)
+    }
+
+    /// Finds callees of matching symbols with duplicate callee nodes removed.
+    pub fn callees(&self, symbol: &str, limit: usize) -> anyhow::Result<Vec<(Node, Edge)>> {
+        let matches = self.exact_symbol_matches(symbol, 50)?;
+        let traverser = GraphTraverser::new(QueryBuilder::new(self.queries.get_conn()));
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for node in matches {
+            let callees = traverser
+                .get_callees(&node.id, 1)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            for (callee, edge) in callees {
+                if seen.insert(callee.id.clone()) {
+                    out.push((callee, edge));
+                }
+            }
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Finds nodes affected by changes to matching symbols.
+    pub fn impact_nodes(&self, symbol: &str, depth: usize) -> anyhow::Result<Vec<Node>> {
+        let depth = depth.max(1).min(10);
+        let matches = self.exact_symbol_matches(symbol, 50)?;
+        let match_ids: HashSet<String> = matches.iter().map(|node| node.id.clone()).collect();
+        let traverser = GraphTraverser::new(QueryBuilder::new(self.queries.get_conn()));
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for node in matches {
+            let impact = traverser
+                .get_impact_radius(&node.id, depth)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            for (_, affected) in impact.nodes {
+                if !match_ids.contains(&affected.id) && seen.insert(affected.id.clone()) {
+                    out.push(affected);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.start_line.cmp(&b.start_line)));
+        Ok(out)
+    }
+
+    /// Renders graph relationship rows in a concise deterministic text format.
+    pub fn render_graph_list(title: &str, items: &[(Node, Edge)]) -> String {
+        if items.is_empty() {
+            return format!("{}: none\n", title);
+        }
+        let mut out = format!("{} ({}):\n", title, items.len());
+        for (node, edge) in items {
+            out.push_str(&format!(
+                "- {} ({}) at {}:{} via {}\n",
+                node.name,
+                node.kind.as_str(),
+                node.file_path,
+                node.start_line,
+                edge.kind.as_str()
+            ));
+        }
+        out
     }
 
     /// Resolves a user-supplied file hint to an indexed project-relative path.

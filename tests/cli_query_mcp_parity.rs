@@ -207,6 +207,87 @@ fn query_service_filters_search_results_by_kind() {
 }
 
 #[test]
+fn query_service_graph_methods_return_shared_relationship_results() {
+    let dir = fixture_project();
+    let project = codegraph::project::resolve_project(Some(
+        dir.path().to_str().expect("temp path is utf-8"),
+    ))
+    .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+    let caller = codegraph::types::Node::new(
+        "app.ts::caller".to_string(),
+        codegraph::types::NodeKind::Function,
+        "caller".to_string(),
+        "app.ts::caller".to_string(),
+        "app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        2,
+        4,
+        1,
+        20,
+    );
+    let target = codegraph::types::Node::new(
+        "app.ts::target".to_string(),
+        codegraph::types::NodeKind::Function,
+        "target".to_string(),
+        "app.ts::target".to_string(),
+        "app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        6,
+        8,
+        1,
+        20,
+    );
+    let callee = codegraph::types::Node::new(
+        "app.ts::callee".to_string(),
+        codegraph::types::NodeKind::Function,
+        "callee".to_string(),
+        "app.ts::callee".to_string(),
+        "app.ts".to_string(),
+        codegraph::types::Language::TypeScript,
+        10,
+        12,
+        1,
+        20,
+    );
+    for node in [&caller, &target, &callee] {
+        queries.insert_node(node).expect("insert node");
+    }
+    queries
+        .insert_edge(&codegraph::types::Edge::new(
+            caller.id.clone(),
+            target.id.clone(),
+            codegraph::types::EdgeKind::Calls,
+        ))
+        .expect("insert caller edge");
+    queries
+        .insert_edge(&codegraph::types::Edge::new(
+            target.id.clone(),
+            callee.id.clone(),
+            codegraph::types::EdgeKind::Calls,
+        ))
+        .expect("insert callee edge");
+    let service = codegraph::query_service::QueryService::new(project, queries);
+
+    let callers = service.callers("target", 10).expect("callers");
+    let callees = service.callees("target", 10).expect("callees");
+    let impact = service.impact_nodes("target", 3).expect("impact");
+    let rendered = codegraph::query_service::QueryService::render_graph_list("Callees", &callees);
+    let caller_names = callers.iter().map(|(node, _)| &node.name).collect::<Vec<_>>();
+    let callee_names = callees.iter().map(|(node, _)| &node.name).collect::<Vec<_>>();
+    let impact_names = impact.iter().map(|node| &node.name).collect::<Vec<_>>();
+
+    assert_eq!(caller_names, vec![&caller.name]);
+    assert_eq!(callee_names, vec![&callee.name]);
+    assert_eq!(impact_names, vec![&caller.name]);
+    assert!(
+        rendered.contains("via calls"),
+        "expected edge kind in rendered graph list:\n{rendered}"
+    );
+}
+
+#[test]
 fn query_kind_filter_is_applied_before_limit() {
     let dir = many_matching_functions_then_class_project();
     let output = run_codegraph(
