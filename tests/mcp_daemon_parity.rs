@@ -231,10 +231,23 @@ fn two_mcp_launchers_share_one_daemon() {
 fn no_daemon_env_uses_direct_mode_without_pidfile() {
     let project = fixture_project();
 
-    let response = initialize_over_stdio_with_env(project.path(), &[("CODEGRAPH_NO_DAEMON", "1")]);
+    let response =
+        initialize_over_stdio_with_env(project.path(), &[("CODEGRAPH_NO_DAEMON", "true")]);
 
     assert_eq!(response["result"]["serverInfo"]["name"], "CodeGraph");
     assert!(!project.path().join(".codegraph").join("daemon.pid").exists());
+}
+
+#[test]
+fn no_daemon_false_value_keeps_daemon_enabled() {
+    let project = fixture_project();
+
+    let response =
+        initialize_over_stdio_with_env(project.path(), &[("CODEGRAPH_NO_DAEMON", "false")]);
+    let pid = read_pidfile(project.path())["pid"].clone();
+
+    stop_pid(&pid);
+    assert_eq!(response["result"]["serverInfo"]["name"], "CodeGraph");
 }
 
 #[test]

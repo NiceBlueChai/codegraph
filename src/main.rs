@@ -659,7 +659,7 @@ fn cmd_serve(path: Option<&str>, mcp: bool, mcp_daemon: bool, no_watch: bool) ->
             }
         };
 
-        if std::env::var("CODEGRAPH_NO_DAEMON").ok().as_deref() != Some("1") {
+        if !daemon_opt_out_set() {
             match codegraph::mcp::proxy::run(project.clone()) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
@@ -686,6 +686,16 @@ fn cmd_serve(path: Option<&str>, mcp: bool, mcp_daemon: bool, no_watch: bool) ->
     }
 
     Ok(())
+}
+
+fn daemon_opt_out_set() -> bool {
+    match std::env::var("CODEGRAPH_NO_DAEMON") {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
 }
 
 fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Result<()> {
