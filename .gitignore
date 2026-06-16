@@ -49,6 +49,12 @@ npm-debug.log*
 
 test_frameworks
 
+# Local scratch files from manual database experiments
+/test.db
+/test_db.exe
+/test_db.pdb
+/test_db.rs
+
 # Test language repos for manual testing
 test-languages/
 
