@@ -36,6 +36,7 @@ tokio = { version = "1.35", features = ["full"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rmcp = { version = "1.7", features = ["server", "macros", "schemars", "transport-io", "transport-async-rw"] }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
