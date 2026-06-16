@@ -34,16 +34,13 @@ async fn run_daemon_async(project: ProjectContext) -> anyhow::Result<()> {
     let idle_timeout = daemon_idle_timeout();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
     let mut active_connections = 0usize;
-    let mut served_connection = false;
 
     loop {
-        let accepted = if active_connections == 0 && served_connection {
+        let accepted = if active_connections == 0 {
             tokio::select! {
                 accepted = listener.accept() => accepted,
                 _ = tokio::time::sleep(idle_timeout) => break,
             }
-        } else if active_connections == 0 {
-            listener.accept().await
         } else {
             tokio::select! {
                 accepted = listener.accept() => accepted,
@@ -67,7 +64,6 @@ async fn run_daemon_async(project: ProjectContext) -> anyhow::Result<()> {
         let service = service.clone();
         let done_tx = done_tx.clone();
         active_connections += 1;
-        served_connection = true;
         tokio::spawn(async move {
             let (read, write) = stream.into_split();
             match rmcp::serve_server(service, (read, write)).await {

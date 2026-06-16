@@ -19,6 +19,24 @@ pub fn register_tools() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Register MCP tools as wire-compatible JSON objects for local handshake responses.
+pub fn register_tools_json() -> Vec<Value> {
+    register_tools()
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": {
+                    "type": tool.input_schema.schema_type,
+                    "properties": tool.input_schema.properties,
+                    "required": tool.input_schema.required.unwrap_or_default(),
+                },
+            })
+        })
+        .collect()
+}
+
 fn canonical_tool_names() -> Vec<&'static str> {
     let requested_tools = match std::env::var("CODEGRAPH_MCP_TOOLS") {
         Ok(value) => value
