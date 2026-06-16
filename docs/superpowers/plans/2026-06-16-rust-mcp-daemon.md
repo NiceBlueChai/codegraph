@@ -263,7 +263,8 @@ Create `src/mcp/proxy.rs`:
 
 - [ ] **Step 3: Route `serve --mcp`**
 
-In `cmd_serve`, if `CODEGRAPH_NO_DAEMON != 1` and project resolves, run proxy. If proxy setup fails, fall back to direct `rmcp` stdio service.
+In `cmd_serve`, if `CODEGRAPH_NO_DAEMON` is not truthy and project resolves, run proxy. Treat empty,
+`0`, and `false` as disabled opt-out values. If proxy setup fails, fall back to direct `rmcp` stdio service.
 
 - [ ] **Step 4: Verify shared daemon**
 
@@ -293,7 +294,8 @@ git commit -m "feat(mcp): 通过proxy复用daemon"
 
 Add tests for:
 
-- `CODEGRAPH_NO_DAEMON=1` responds to initialize and creates no pidfile
+- `CODEGRAPH_NO_DAEMON=true` responds to initialize and creates no pidfile
+- `CODEGRAPH_NO_DAEMON=false` still uses daemon mode
 - stale pidfile with dead pid is replaced
 - pidfile version mismatch falls back to direct mode
 - daemon exits after last client disconnects and `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` elapses

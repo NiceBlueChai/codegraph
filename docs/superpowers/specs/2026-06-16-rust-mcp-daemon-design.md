@@ -25,7 +25,7 @@ proxy 连接它。这样可以复用项目状态、数据库连接、watcher 和
 1. `codegraph serve --mcp` 默认尝试连接或启动项目级 daemon。
 2. 同一已初始化项目同时启动多个 MCP 会话时，只产生一个 daemon。
 3. 每个 launcher 作为 proxy，把 stdio JSON-RPC 行转发到 daemon socket。
-4. `CODEGRAPH_NO_DAEMON=1` 保留 direct stdio MCP 行为。
+4. `CODEGRAPH_NO_DAEMON` 为 truthy 时保留 direct stdio MCP 行为；空、`0`、`false` 不禁用 daemon。
 5. daemon pidfile 可检测 stale daemon，并允许后来的 launcher 清理后接管。
 6. daemon 空闲一段时间后退出并清理 pidfile。
 7. daemon 版本与 launcher 版本不匹配时，launcher 不连接旧 daemon，回退 direct mode。
@@ -55,7 +55,7 @@ proxy 连接它。这样可以复用项目状态、数据库连接、watcher 和
 
 `serve --mcp` 分两种模式：
 
-- direct mode：现有 stdio MCP server。触发条件是 `CODEGRAPH_NO_DAEMON=1`，项目未初始化，或 daemon
+- direct mode：现有 stdio MCP server。触发条件是 `CODEGRAPH_NO_DAEMON` 为 truthy、项目未初始化，或 daemon
   连接/启动过程明确失败。
 - daemon mode：默认路径。launcher 尝试连接 `.codegraph/daemon.pid` 指向的 daemon；连接失败则抢锁
   启动新 daemon；成功后作为 proxy 转发 stdio。
@@ -123,6 +123,22 @@ proxy 运行在 launcher 进程里：
 
 第一版 proxy 不解析 JSON-RPC 内容，不做请求级 fallback。
 
+AI 客户端配置仍然使用 stdio：
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp", "--path", "<project-root>"]
+    }
+  }
+}
+```
+
+`serve --mcp` 是客户端看到的 stdio 进程；daemon socket/TCP 是 CodeGraph 内部连接，不写进 AI 客户端配置。
+
 ### 错误处理
 
 - pidfile 无法解析：视为 stale，删除并重试启动。
@@ -137,7 +153,7 @@ proxy 运行在 launcher 进程里：
 
 1. 两个 `serve --mcp` 会话共享一个 daemon。
 2. 三个并发 launcher 只创建一个 daemon。
-3. `CODEGRAPH_NO_DAEMON=1` 不创建 pidfile。
+3. `CODEGRAPH_NO_DAEMON=true` 不创建 pidfile；`CODEGRAPH_NO_DAEMON=false` 仍启用 daemon。
 4. stale pidfile 被清理，新 daemon 接管。
 5. 版本不匹配时 direct mode 仍能响应 initialize。
 6. 关闭最后一个 client 后 daemon idle timeout 并删除 pidfile。
