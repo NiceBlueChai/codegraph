@@ -1,43 +1,149 @@
-use serde_json::{json, Value};
-use crate::db::QueryBuilder;
-use crate::core::query::GraphTraverser;
-use crate::mcp::protocol::{ToolDefinition, ToolInputSchema, CallToolResult, ContentBlock};
+//! MCP tool registry, advertised schemas, server instructions, and service-backed handlers.
 
-/// Register all available MCP tools
+use crate::db::QueryBuilder;
+use crate::mcp::protocol::{CallToolResult, ContentBlock, ToolDefinition, ToolInputSchema};
+use crate::query_service::QueryService;
+use serde_json::{json, Value};
+
+const TOOL_PREFIX: &str = "codegraph_";
+const ALL_TOOLS: &[&str] = &[
+    "explore", "node", "search", "callers", "callees", "impact", "files", "status",
+];
+const DEFAULT_TOOLS: &[&str] = &["explore", "node", "search", "callers"];
+
+/// Register the TypeScript-compatible MCP tool surface.
 pub fn register_tools() -> Vec<ToolDefinition> {
-    vec![
-        query_tool(),
-        callers_tool(),
-        callees_tool(),
-        impact_tool(),
-        search_tool(),
-        stats_tool(),
-    ]
+    canonical_tool_names()
+        .into_iter()
+        .filter_map(tool_by_short_name)
+        .collect()
 }
 
-/// Query tool: Find symbols by name
-fn query_tool() -> ToolDefinition {
+fn canonical_tool_names() -> Vec<&'static str> {
+    let requested_tools = match std::env::var("CODEGRAPH_MCP_TOOLS") {
+        Ok(value) => value
+            .split(',')
+            .map(normalize_tool_name)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        Err(_) => return DEFAULT_TOOLS.to_vec(),
+    };
+
+    if requested_tools.is_empty() {
+        return DEFAULT_TOOLS.to_vec();
+    }
+
+    ALL_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| requested_tools.iter().any(|requested| requested == name))
+        .collect()
+}
+
+/// Return concise usage instructions for MCP clients.
+pub fn server_instructions(active: bool) -> String {
+    if active {
+        "CodeGraph is active. Start with codegraph_explore to understand relevant files, use \
+         codegraph_node for file snippets or symbol details, codegraph_search to locate code, and \
+         codegraph_callers to inspect call sites."
+            .to_string()
+    } else {
+        "CodeGraph is inactive for this workspace. Run `codegraph init -i` in the project before \
+         using MCP tools."
+            .to_string()
+    }
+}
+
+fn normalize_tool_name(name: &str) -> &str {
+    name.trim().strip_prefix(TOOL_PREFIX).unwrap_or(name.trim())
+}
+
+fn tool_by_short_name(name: &str) -> Option<ToolDefinition> {
+    match name {
+        "explore" => Some(explore_tool()),
+        "node" => Some(node_tool()),
+        "search" => Some(search_tool()),
+        "callers" => Some(callers_tool()),
+        "callees" => Some(callees_tool()),
+        "impact" => Some(impact_tool()),
+        "files" => Some(files_tool()),
+        "status" => Some(status_tool()),
+        _ => None,
+    }
+}
+
+/// Explore tool: Find relevant files and symbols for a natural-language query.
+fn explore_tool() -> ToolDefinition {
     ToolDefinition {
-        name: "codegraph_query".to_string(),
-        description: "Search for symbols (functions, classes, variables) by name in the codebase".to_string(),
+        name: "codegraph_explore".to_string(),
+        description:
+            "Explore relevant code files and symbols for a query before drilling into details."
+                .to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "name": {
+                "query": {
                     "type": "string",
-                    "description": "Symbol name to search for"
+                    "description": "Question, feature, or symbol area to explore"
                 },
-                "kind": {
-                    "type": "string",
-                    "description": "Optional symbol kind filter (function, class, method, etc.)",
-                    "enum": ["function", "class", "method", "interface", "struct", "variable"]
+                "maxFiles": {
+                    "type": "integer",
+                    "description": "Maximum number of files to include"
                 },
-                "file_pattern": {
+                "projectPath": {
                     "type": "string",
-                    "description": "Optional file pattern to filter results"
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
-            required: Some(vec!["name".to_string()]),
+            required: Some(vec!["query".to_string()]),
+        },
+    }
+}
+
+/// Node tool: Inspect a file range or symbol details.
+fn node_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "codegraph_node".to_string(),
+        description: "Inspect source for a file or retrieve details for symbols in the code graph."
+            .to_string(),
+        input_schema: ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name to inspect"
+                },
+                "file": {
+                    "type": "string",
+                    "description": "File path to read from the indexed project"
+                },
+                "line": {
+                    "type": "integer",
+                    "description": "One-based line number to inspect"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "One-based starting line offset for file reads"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines or symbols to return"
+                },
+                "symbolsOnly": {
+                    "type": "boolean",
+                    "description": "Return symbol summaries without source text"
+                },
+                "includeCode": {
+                    "type": "boolean",
+                    "description": "Include source code when returning symbol details"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
+                }
+            })),
+            required: Some(vec![]),
         },
     }
 }
@@ -46,21 +152,28 @@ fn query_tool() -> ToolDefinition {
 fn callers_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_callers".to_string(),
-        description: "Find all callers of a specific function or method".to_string(),
+        description: "Find call sites that reference a function, method, or symbol.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "symbol_name": {
+                "symbol": {
                     "type": "string",
-                    "description": "Name of the function or method"
+                    "description": "Function, method, or symbol to find callers for"
                 },
-                "max_depth": {
+                "file": {
+                    "type": "string",
+                    "description": "Optional file path to disambiguate the symbol"
+                },
+                "limit": {
                     "type": "integer",
-                    "description": "Maximum depth to search for callers (default: 1)",
-                    "default": 1
+                    "description": "Maximum number of callers to return"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
-            required: Some(vec!["symbol_name".to_string()]),
+            required: Some(vec!["symbol".to_string()]),
         },
     }
 }
@@ -69,21 +182,28 @@ fn callers_tool() -> ToolDefinition {
 fn callees_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_callees".to_string(),
-        description: "Find all functions called by a specific function or method".to_string(),
+        description: "Find functions, methods, or symbols called by a target symbol.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "symbol_name": {
+                "symbol": {
                     "type": "string",
-                    "description": "Name of the function or method"
+                    "description": "Function, method, or symbol to find callees for"
                 },
-                "max_depth": {
+                "file": {
+                    "type": "string",
+                    "description": "Optional file path to disambiguate the symbol"
+                },
+                "limit": {
                     "type": "integer",
-                    "description": "Maximum depth to search for callees (default: 1)",
-                    "default": 1
+                    "description": "Maximum number of callees to return"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
-            required: Some(vec!["symbol_name".to_string()]),
+            required: Some(vec!["symbol".to_string()]),
         },
     }
 }
@@ -92,21 +212,33 @@ fn callees_tool() -> ToolDefinition {
 fn impact_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_impact".to_string(),
-        description: "Analyze the impact radius of changing a specific symbol".to_string(),
+        description: "Analyze the upstream impact of changing a function, method, or symbol."
+            .to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
-                "symbol_name": {
+                "symbol": {
                     "type": "string",
-                    "description": "Name of the symbol to analyze"
+                    "description": "Function, method, or symbol to analyze"
                 },
-                "max_depth": {
+                "file": {
+                    "type": "string",
+                    "description": "Optional file path to disambiguate the symbol"
+                },
+                "depth": {
                     "type": "integer",
-                    "description": "Maximum depth for impact analysis (default: 3)",
-                    "default": 3
+                    "description": "Maximum relationship depth to traverse"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of impacted nodes to return"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
-            required: Some(vec!["symbol_name".to_string()]),
+            required: Some(vec!["symbol".to_string()]),
         },
     }
 }
@@ -115,18 +247,26 @@ fn impact_tool() -> ToolDefinition {
 fn search_tool() -> ToolDefinition {
     ToolDefinition {
         name: "codegraph_search".to_string(),
-        description: "Perform full-text search across the codebase".to_string(),
+        description: "Search indexed code text and symbols to locate relevant definitions."
+            .to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "query": {
                     "type": "string",
-                    "description": "Search query text"
+                    "description": "Search query text or symbol fragment"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results (default: 20)",
-                    "default": 20
+                    "description": "Maximum number of search results to return"
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional symbol kind filter"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
                 }
             })),
             required: Some(vec!["query".to_string()]),
@@ -134,14 +274,63 @@ fn search_tool() -> ToolDefinition {
     }
 }
 
-/// Stats tool: Get graph statistics
-fn stats_tool() -> ToolDefinition {
+/// Files tool: List indexed files with optional filtering and formatting.
+fn files_tool() -> ToolDefinition {
     ToolDefinition {
-        name: "codegraph_stats".to_string(),
-        description: "Get statistics about the code graph (node count, edge count, etc.)".to_string(),
+        name: "codegraph_files".to_string(),
+        description: "List indexed files with optional filters and output controls.".to_string(),
         input_schema: ToolInputSchema {
             schema_type: "object".to_string(),
-            properties: Some(json!({})),
+            properties: Some(json!({
+                "filter": {
+                    "type": "string",
+                    "description": "Text filter for indexed file paths"
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern used to match file paths"
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Output shape for file listings",
+                    "enum": ["tree", "flat"]
+                },
+                "maxDepth": {
+                    "type": "integer",
+                    "description": "Maximum directory depth for tree output"
+                },
+                "grouped": {
+                    "type": "boolean",
+                    "description": "Group files by directory or language when supported"
+                },
+                "noMetadata": {
+                    "type": "boolean",
+                    "description": "Omit language, size, and graph metadata"
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
+                }
+            })),
+            required: Some(vec![]),
+        },
+    }
+}
+
+/// Status tool: Report CodeGraph workspace index status.
+fn status_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "codegraph_status".to_string(),
+        description: "Show whether CodeGraph is initialized and summarize indexed graph metadata."
+            .to_string(),
+        input_schema: ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project path to target instead of the current working directory"
+                }
+            })),
             required: Some(vec![]),
         },
     }
@@ -151,266 +340,226 @@ fn stats_tool() -> ToolDefinition {
 pub fn execute_tool<'a>(
     tool_name: &str,
     arguments: Option<Value>,
+    project: &crate::project::ProjectContext,
     queries: &QueryBuilder<'a>,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    match tool_name {
-        "codegraph_query" => handle_query(arguments, queries),
-        "codegraph_callers" => handle_callers(arguments, queries),
-        "codegraph_callees" => handle_callees(arguments, queries),
-        "codegraph_impact" => handle_impact(arguments, queries),
-        "codegraph_search" => handle_search(arguments, queries),
-        "codegraph_stats" => handle_stats(arguments, queries),
-        _ => Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Unknown tool: {}", tool_name),
-            }],
-            is_error: Some(true),
-        }),
+    if !is_known_tool_name(tool_name) {
+        return text_error(format!("Unknown tool: {}", tool_name));
     }
-}
-
-fn handle_query<'a>(
-    args: Option<Value>,
-    queries: &QueryBuilder<'a>,
-) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let args = args.unwrap_or(json!({}));
-    let name = args["name"].as_str().unwrap_or("");
-    let kind_filter = args["kind"].as_str().map(|s| s.to_string());
-
-    // Simple name-based search
-    let nodes = queries.search_nodes(name, None)?;
-
-    let mut results = Vec::new();
-    for node in &nodes {
-        if let Some(ref kind) = kind_filter {
-            if node.node.kind.as_str() != kind {
-                continue;
-            }
-        }
-
-        results.push(format!(
-            "- {} ({}) in {} at line {}-{}",
-            node.node.name,
-            node.node.kind.as_str(),
-            node.node.file_path,
-            node.node.start_line,
-            node.node.end_line
+    if !register_tools().iter().any(|tool| tool.name == tool_name) {
+        return text_error(format!(
+            "Tool {} is disabled via CODEGRAPH_MCP_TOOLS",
+            tool_name
         ));
     }
 
-    if results.is_empty() {
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("No symbols found matching '{}'", name),
-            }],
-            is_error: None,
-        })
-    } else {
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Found {} symbols:\n{}", results.len(), results.join("\n")),
-            }],
-            is_error: None,
-        })
+    let args = arguments.unwrap_or_else(|| json!({}));
+    let service = QueryService::new(project.clone(), QueryBuilder::new(queries.get_conn()));
+
+    match tool_name {
+        "codegraph_explore" => handle_explore(&service, &args),
+        "codegraph_node" => handle_node(&service, &args),
+        "codegraph_search" => handle_search(&service, &args),
+        "codegraph_callers" => handle_callers(&service, &args),
+        "codegraph_callees" => handle_callees(&service, &args),
+        "codegraph_impact" => handle_impact(&service, &args),
+        "codegraph_files" => handle_files(&service, &args),
+        "codegraph_status" => handle_status(&service),
+        _ => text_error(format!("Unknown tool: {}", tool_name)),
     }
 }
 
-fn handle_callers<'a>(
-    args: Option<Value>,
-    queries: &QueryBuilder<'a>,
+fn handle_explore(
+    service: &QueryService<'_>,
+    args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let args = args.unwrap_or(json!({}));
-    let symbol_name = args["symbol_name"].as_str().unwrap_or("");
-    let max_depth = args["max_depth"].as_u64().unwrap_or(1) as usize;
+    let query = match required_string(args, "query") {
+        Ok(query) => query,
+        Err(error) => return text_error(error),
+    };
+    let max_files = args["maxFiles"].as_u64().unwrap_or(5) as usize;
 
-    // Find the node first
-    let nodes = queries.search_nodes(symbol_name, None)?;
-    if nodes.is_empty() {
-        return Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Symbol '{}' not found", symbol_name),
-            }],
-            is_error: None,
-        });
-    }
-
-    let traverser = GraphTraverser::new(QueryBuilder::new(queries.get_conn()));
-    let node_id = &nodes[0].node.id;
-
-    let callers = traverser.get_callers(node_id, max_depth)?;
-
-    if callers.is_empty() {
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("No callers found for '{}'", symbol_name),
-            }],
-            is_error: None,
-        })
-    } else {
-        let caller_list: Vec<String> = callers.iter().map(|(node, _)| {
-            format!("- {} in {} at line {}", node.name, node.file_path, node.start_line)
-        }).collect();
-
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Callers of '{}':\n{}", symbol_name, caller_list.join("\n")),
-            }],
-            is_error: None,
-        })
-    }
+    text(service.render_explore_text(query, max_files)?)
 }
 
-fn handle_callees<'a>(
-    args: Option<Value>,
-    queries: &QueryBuilder<'a>,
+fn handle_node(
+    service: &QueryService<'_>,
+    args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let args = args.unwrap_or(json!({}));
-    let symbol_name = args["symbol_name"].as_str().unwrap_or("");
-    let max_depth = args["max_depth"].as_u64().unwrap_or(1) as usize;
+    let offset = args["offset"]
+        .as_u64()
+        .or_else(|| args["line"].as_u64())
+        .map(|n| n as usize);
+    let limit = args["limit"].as_u64().map(|n| n as usize);
+    let symbols_only = args["symbolsOnly"].as_bool().unwrap_or(false);
 
-    let nodes = queries.search_nodes(symbol_name, None)?;
-    if nodes.is_empty() {
-        return Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Symbol '{}' not found", symbol_name),
-            }],
-            is_error: None,
-        });
+    if let Some(file) = args["file"].as_str() {
+        if symbols_only {
+            return text(service.render_symbols_only_text(file)?);
+        }
+        let view = service.file_view(file, offset, limit)?;
+        return text(service.render_file_view_text(&view));
     }
 
-    let traverser = GraphTraverser::new(QueryBuilder::new(queries.get_conn()));
-    let node_id = &nodes[0].node.id;
-
-    let callees = traverser.get_callees(node_id, max_depth)?;
-
-    if callees.is_empty() {
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("'{}' does not call any other functions", symbol_name),
-            }],
-            is_error: None,
-        })
-    } else {
-        let callee_list: Vec<String> = callees.iter().map(|(node, _)| {
-            format!("- {} in {} at line {}", node.name, node.file_path, node.start_line)
-        }).collect();
-
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Functions called by '{}':\n{}", symbol_name, callee_list.join("\n")),
-            }],
-            is_error: None,
-        })
+    if let Some(symbol) = args["symbol"].as_str() {
+        let max_files = if args["includeCode"].as_bool().unwrap_or(true) {
+            1
+        } else {
+            0
+        };
+        return text(service.render_explore_text(symbol, max_files)?);
     }
+
+    text_error("Pass either `file` or `symbol`.".to_string())
 }
 
-fn handle_impact<'a>(
-    args: Option<Value>,
-    queries: &QueryBuilder<'a>,
+fn handle_search(
+    service: &QueryService<'_>,
+    args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let args = args.unwrap_or(json!({}));
-    let symbol_name = args["symbol_name"].as_str().unwrap_or("");
-    let max_depth = args["max_depth"].as_u64().unwrap_or(3) as usize;
-
-    let nodes = queries.search_nodes(symbol_name, None)?;
-    if nodes.is_empty() {
-        return Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Symbol '{}' not found", symbol_name),
-            }],
-            is_error: None,
-        });
-    }
-
-    let traverser = GraphTraverser::new(QueryBuilder::new(queries.get_conn()));
-    let node_id = &nodes[0].node.id;
-
-    let impact = traverser.get_impact_radius(node_id, max_depth)?;
-
-    Ok(CallToolResult {
-        content: vec![ContentBlock {
-            content_type: "text".to_string(),
-            text: format!(
-                "Impact analysis for '{}':\n- Affected nodes: {}\n- Affected edges: {}",
-                symbol_name,
-                impact.nodes.len(),
-                impact.edges.len()
-            ),
-        }],
-        is_error: None,
-    })
-}
-
-fn handle_search<'a>(
-    args: Option<Value>,
-    queries: &QueryBuilder<'a>,
-) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let args = args.unwrap_or(json!({}));
-    let query_text = args["query"].as_str().unwrap_or("");
+    let query = match required_string(args, "query") {
+        Ok(query) => query,
+        Err(error) => return text_error(error),
+    };
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+    let kind = args["kind"].as_str();
+    let results = service.search(query, limit, kind)?;
+    let output = json!({
+        "query": query,
+        "results": results.iter().map(|result| json!({
+            "name": result.node.name,
+            "kind": result.node.kind.as_str(),
+            "file": result.node.file_path,
+            "line": result.node.start_line,
+            "signature": result.node.signature,
+        })).collect::<Vec<_>>(),
+        "total": results.len(),
+    });
 
-    let results = queries.full_text_search(query_text, limit)?;
-
-    if results.is_empty() {
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("No results found for '{}'", query_text),
-            }],
-            is_error: None,
-        })
-    } else {
-        let result_list: Vec<String> = results.iter().map(|r| {
-            format!(
-                "- {} ({}) in {} [score: {:.2}]",
-                r.node.name,
-                r.node.kind.as_str(),
-                r.node.file_path,
-                r.score
-            )
-        }).collect();
-
-        Ok(CallToolResult {
-            content: vec![ContentBlock {
-                content_type: "text".to_string(),
-                text: format!("Search results for '{}':\n{}", query_text, result_list.join("\n")),
-            }],
-            is_error: None,
-        })
-    }
+    text(serde_json::to_string_pretty(&output)?)
 }
 
-fn handle_stats<'a>(
-    _args: Option<Value>,
-    queries: &QueryBuilder<'a>,
+fn handle_callers(
+    service: &QueryService<'_>,
+    args: &Value,
 ) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let stats = queries.get_stats()?;
+    let symbol = match required_string(args, "symbol") {
+        Ok(symbol) => symbol,
+        Err(error) => return text_error(error),
+    };
+    let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+    let callers = service.callers(symbol, limit)?;
+    let visible = callers.iter().take(limit).cloned().collect::<Vec<_>>();
 
+    text(QueryService::render_graph_list(
+        &format!("Callers of '{}'", symbol),
+        &visible,
+        callers.len(),
+    ))
+}
+
+fn handle_callees(
+    service: &QueryService<'_>,
+    args: &Value,
+) -> Result<CallToolResult, Box<dyn std::error::Error>> {
+    let symbol = match required_string(args, "symbol") {
+        Ok(symbol) => symbol,
+        Err(error) => return text_error(error),
+    };
+    let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+    let callees = service.callees(symbol, limit)?;
+    let visible = callees.iter().take(limit).cloned().collect::<Vec<_>>();
+
+    text(QueryService::render_graph_list(
+        &format!("Callees of '{}'", symbol),
+        &visible,
+        callees.len(),
+    ))
+}
+
+fn handle_impact(
+    service: &QueryService<'_>,
+    args: &Value,
+) -> Result<CallToolResult, Box<dyn std::error::Error>> {
+    let symbol = match required_string(args, "symbol") {
+        Ok(symbol) => symbol,
+        Err(error) => return text_error(error),
+    };
+    let depth = args["depth"].as_u64().unwrap_or(3) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+    let impact = service.impact_summary(symbol, depth)?;
+    let output = json!({
+        "symbol": symbol,
+        "affected": impact.affected.iter().take(limit).map(|node| json!({
+            "name": node.name,
+            "filePath": node.file_path,
+            "startLine": node.start_line,
+            "kind": node.kind.as_str(),
+        })).collect::<Vec<_>>(),
+        "total": impact.affected.len(),
+        "edgeCount": impact.edge_count,
+    });
+
+    text(serde_json::to_string_pretty(&output)?)
+}
+
+fn handle_files(
+    service: &QueryService<'_>,
+    args: &Value,
+) -> Result<CallToolResult, Box<dyn std::error::Error>> {
+    let include_metadata = !args["noMetadata"].as_bool().unwrap_or(false);
+    let listing = service.list_files(
+        args["filter"].as_str(),
+        args["pattern"].as_str(),
+        include_metadata,
+    )?;
+
+    text(serde_json::to_string_pretty(&listing)?)
+}
+
+fn handle_status(service: &QueryService<'_>) -> Result<CallToolResult, Box<dyn std::error::Error>> {
+    let stats = service.queries.get_stats()?;
+    let output = json!({
+        "initialized": true,
+        "root": service.project.root.display().to_string(),
+        "nodes": stats.node_count,
+        "edges": stats.edge_count,
+        "files": stats.file_count,
+        "unresolved_refs": stats.unresolved_ref_count,
+    });
+
+    text(serde_json::to_string_pretty(&output)?)
+}
+
+fn text(text: String) -> Result<CallToolResult, Box<dyn std::error::Error>> {
     Ok(CallToolResult {
         content: vec![ContentBlock {
             content_type: "text".to_string(),
-            text: format!(
-                "CodeGraph Statistics:\n\
-                 - Nodes: {}\n\
-                 - Edges: {}\n\
-                 - Files: {}\n\
-                 - Unresolved references: {}",
-                stats.node_count,
-                stats.edge_count,
-                stats.file_count,
-                stats.unresolved_ref_count
-            ),
+            text,
         }],
         is_error: None,
     })
+}
+
+fn text_error(text: String) -> Result<CallToolResult, Box<dyn std::error::Error>> {
+    Ok(CallToolResult {
+        content: vec![ContentBlock {
+            content_type: "text".to_string(),
+            text,
+        }],
+        is_error: Some(true),
+    })
+}
+
+fn required_string<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
+    args[name]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Missing required argument `{}`", name))
+}
+
+fn is_known_tool_name(name: &str) -> bool {
+    name.strip_prefix(TOOL_PREFIX)
+        .map(|short| ALL_TOOLS.contains(&short))
+        .unwrap_or(false)
 }

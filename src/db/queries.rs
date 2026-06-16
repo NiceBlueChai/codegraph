@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Transaction, params, OptionalExtension};
+use rusqlite::{params, types::Value, Connection, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::str::FromStr;
 use log::debug;
@@ -579,8 +579,8 @@ impl<'a> QueryBuilder<'a> {
     pub fn search_nodes(&self, query: &str, options: Option<&SearchOptions>) -> Result<Vec<SearchResult>, rusqlite::Error> {
         let default_opts = SearchOptions::default();
         let opts = options.unwrap_or(&default_opts);
-        
-        let sql = format!(
+
+        let mut sql = String::from(
             "SELECT n.id, n.kind, n.name, n.qualified_name, n.file_path, n.language,
                     n.start_line, n.end_line, n.start_column, n.end_column,
                     n.docstring, n.signature, n.visibility, n.is_exported,
@@ -589,17 +589,28 @@ impl<'a> QueryBuilder<'a> {
                     rank
              FROM nodes n
              JOIN nodes_fts fts ON n.rowid = fts.rowid
-             WHERE nodes_fts MATCH ?1
-             ORDER BY rank
-             LIMIT ?2"
+             WHERE nodes_fts MATCH ?"
         );
+
+        let escaped_query = escape_fts_query(query);
+        let mut params_values = vec![Value::Text(escaped_query)];
+        if let Some(kinds) = &opts.kinds {
+            if !kinds.is_empty() {
+                let placeholders = vec!["?"; kinds.len()].join(", ");
+                sql.push_str(&format!(" AND n.kind IN ({})", placeholders));
+                params_values.extend(
+                    kinds
+                        .iter()
+                        .map(|kind| Value::Text(kind.as_str().to_string())),
+                );
+            }
+        }
+        sql.push_str(" ORDER BY rank LIMIT ?");
+        params_values.push(Value::Integer(opts.limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
 
-        // Escape FTS5 special characters
-        let escaped_query = escape_fts_query(query);
-
-        let results = stmt.query_map(params![escaped_query, opts.limit], |row| {
+        let results = stmt.query_map(rusqlite::params_from_iter(params_values), |row| {
             let node = Node {
                 id: row.get(0)?,
                 kind: NodeKind::from_str(&row.get::<_, String>(1)?).unwrap(),
@@ -763,11 +774,13 @@ impl<'a> QueryBuilder<'a> {
     /// Get file-level dependents: files that depend on nodes in the given file
     pub fn get_file_dependents(&self, file_path: &str) -> Result<Vec<String>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT n2.file_path
+            "SELECT DISTINCT n1.file_path
              FROM edges e
              JOIN nodes n1 ON e.source = n1.id
              JOIN nodes n2 ON e.target = n2.id
-             WHERE n1.file_path = ?1 AND n1.file_path != n2.file_path"
+             WHERE n2.file_path = ?1
+               AND n1.file_path != n2.file_path
+               AND e.kind != 'contains'"
         )?;
         let rows = stmt.query_map(params![file_path], |row| row.get(0))?;
         rows.collect::<Result<Vec<String>, _>>()
@@ -916,5 +929,62 @@ mod tests {
         let incoming = queries.get_incoming_edges("node_b").unwrap();
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].source, "node_a");
+    }
+
+    #[test]
+    fn get_file_dependents_returns_files_that_depend_on_target_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = DatabaseConnection::initialize(db_path.to_str().unwrap()).unwrap();
+        initialize_schema(db.get_conn()).unwrap();
+
+        let queries = QueryBuilder::new(db.get_conn());
+        let node_a = Node::new(
+            "node_a".to_string(),
+            NodeKind::Function,
+            "funcA".to_string(),
+            "a.ts::funcA".to_string(),
+            "a.ts".to_string(),
+            Language::TypeScript,
+            1,
+            5,
+            0,
+            40,
+        );
+        let node_b = Node::new(
+            "node_b".to_string(),
+            NodeKind::Function,
+            "funcB".to_string(),
+            "b.ts::funcB".to_string(),
+            "b.ts".to_string(),
+            Language::TypeScript,
+            1,
+            5,
+            0,
+            40,
+        );
+
+        queries.insert_node(&node_a).unwrap();
+        queries.insert_node(&node_b).unwrap();
+        queries
+            .insert_edge(&Edge::new(
+                "node_a".to_string(),
+                "node_b".to_string(),
+                EdgeKind::Calls,
+            ))
+            .unwrap();
+        queries
+            .insert_edge(&Edge::new(
+                "node_b".to_string(),
+                "node_a".to_string(),
+                EdgeKind::Contains,
+            ))
+            .unwrap();
+
+        let b_dependents = queries.get_file_dependents("b.ts").unwrap();
+        assert!(b_dependents.contains(&"a.ts".to_string()));
+
+        let a_dependents = queries.get_file_dependents("a.ts").unwrap();
+        assert!(!a_dependents.contains(&"b.ts".to_string()));
     }
 }

@@ -530,28 +530,27 @@ fn cmd_sync(path: &str, quiet: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
     use std::fs;
 
-    if !codegraph::db::is_initialized(path) {
-        if json {
-            println!("{{\"initialized\": false}}");
-        } else {
-            println!("CodeGraph not initialized");
+    let project = match codegraph::project::resolve_project(Some(path)) {
+        Ok(project) => project,
+        Err(_) if json => {
+            println!("{}", serde_json::json!({"initialized": false}));
+            return Ok(());
         }
-        return Ok(());
-    }
+        Err(err) => {
+            println!("{}", err);
+            return Ok(());
+        }
+    };
 
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+    let db = project.open_database()?;
     let queries = QueryBuilder::new(db.get_conn());
     let stats = queries.get_stats()?;
     let nodes_by_kind = queries.get_nodes_by_kind_counts().unwrap_or_default();
     let languages: Vec<String> = queries.get_languages().unwrap_or_default();
     let files_by_lang = queries.get_file_counts_by_language().unwrap_or_default();
-
-    // Get DB file size
-    let db_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let db_size_bytes = fs::metadata(&project.db_path).map(|m| m.len()).unwrap_or(0);
 
     if json {
         let output = serde_json::json!({
@@ -571,6 +570,7 @@ fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("CodeGraph Status:");
+        println!("  Root: {}", project.root.display());
         println!("  Version: {}", env!("CARGO_PKG_VERSION"));
         println!("  Backend: {:?}", db.get_backend());
         println!("  Journal Mode: {}", db.get_journal_mode().unwrap_or_else(|_| "unknown".to_string()));
@@ -601,26 +601,11 @@ fn cmd_status(path: &str, json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_query(path: &str, query: &str, limit: usize, kind: Option<&str>, json: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
-
-    let options = codegraph::types::SearchOptions {
-        limit,
-        kinds: kind.map(|k| {
-            k.split(',')
-                .filter_map(|s| codegraph::types::NodeKind::from_str(s.trim()))
-                .collect()
-        }),
-        file_pattern: None,
-    };
-    let results = queries.search_nodes(query, Some(&options))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
+    let results = service.search(query, limit, kind)?;
 
     if json {
         let output = serde_json::json!({
@@ -653,22 +638,26 @@ fn cmd_query(path: &str, query: &str, limit: usize, kind: Option<&str>, json: bo
 }
 
 fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-
     if mcp {
-        // Use specified path or current directory
-        let project_root = path.unwrap_or(".");
-
-        if !codegraph::db::is_initialized(project_root) {
-            anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
-        }
-
-        let db_path = get_database_path(project_root);
-        let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+        let project = match codegraph::project::resolve_project(path) {
+            Ok(project) => project,
+            Err(_) => {
+                let mut server = codegraph::mcp::server::MCPServer::new();
+                server
+                    .run()
+                    .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+                return Ok(());
+            }
+        };
+        let db = project.open_database()?;
         let queries = QueryBuilder::new(db.get_conn());
 
-        let mut server = codegraph::mcp::server::MCPServer::new().with_queries(queries);
-        server.run().map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+        let mut server = codegraph::mcp::server::MCPServer::new()
+            .with_project(project)
+            .with_queries(queries);
+        server
+            .run()
+            .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
     } else {
         println!("Starting MCP server...");
         println!("Use --mcp flag to start in MCP mode");
@@ -681,59 +670,16 @@ fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()
 }
 
 fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-    use codegraph::core::query::GraphTraverser;
-    use std::collections::HashSet;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
-
-    // Search for symbol first
-    let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
-    let results = queries.search_nodes(symbol, Some(&options))?;
-
-    // Filter to exact name matches (exact, :: suffix, or . suffix)
-    let exact_matches: Vec<_> = results.iter().filter(|r| {
-        r.node.name == symbol
-            || r.node.qualified_name.ends_with(&format!("::{}", symbol))
-            || r.node.name.ends_with(&format!(".{}", symbol))
-    }).collect();
-
-    // Fall back to top match if exact filter removes everything
-    let matches: Vec<_> = if exact_matches.is_empty() {
-        results.iter().take(1).collect()
-    } else {
-        exact_matches
-    };
-
-    if matches.is_empty() {
-        println!("No matching symbols found for '{}'", symbol);
-        return Ok(());
-    }
-
-    // Get callers with deduplication
-    let traverser = GraphTraverser { queries };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut all_callers: Vec<(codegraph::types::Node, codegraph::types::Edge)> = Vec::new();
-
-    for result in &matches {
-        let callers = traverser.get_callers(&result.node.id, 1).map_err(|e| anyhow::anyhow!("{}", e))?;
-        for (node, edge) in callers {
-            if seen.insert(node.id.clone()) {
-                all_callers.push((node, edge));
-            }
-        }
-    }
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
+    let callers = service.callers(symbol, limit)?;
 
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
-            "callers": all_callers.iter().take(limit).map(|(node, edge)| {
+            "callers": callers.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
                     "filePath": node.file_path,
@@ -742,76 +688,35 @@ fn cmd_callers(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
                     "edgeKind": edge.kind.as_str(),
                 })
             }).collect::<Vec<_>>(),
-            "total": all_callers.len(),
+            "total": callers.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        if all_callers.is_empty() {
-            println!("No callers found for '{}'", symbol);
-        } else {
-            println!("Callers of '{}' ({}):", symbol, all_callers.len());
-            for (node, _) in all_callers.iter().take(limit) {
-                println!("  - {} ({}) at {}:{}", node.name, node.kind.as_str(), node.file_path, node.start_line);
-            }
-        }
+        let visible_callers = callers.iter().take(limit).cloned().collect::<Vec<_>>();
+        print!(
+            "{}",
+            codegraph::query_service::QueryService::render_graph_list(
+                &format!("Callers of '{}'", symbol),
+                &visible_callers,
+                callers.len(),
+            )
+        );
     }
 
     Ok(())
 }
 
 fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-    use codegraph::core::query::GraphTraverser;
-    use std::collections::HashSet;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
-
-    // Search for symbol first
-    let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
-    let results = queries.search_nodes(symbol, Some(&options))?;
-
-    // Filter to exact name matches (exact, :: suffix, or . suffix)
-    let exact_matches: Vec<_> = results.iter().filter(|r| {
-        r.node.name == symbol
-            || r.node.qualified_name.ends_with(&format!("::{}", symbol))
-            || r.node.name.ends_with(&format!(".{}", symbol))
-    }).collect();
-
-    let matches: Vec<_> = if exact_matches.is_empty() {
-        results.iter().take(1).collect()
-    } else {
-        exact_matches
-    };
-
-    if matches.is_empty() {
-        println!("No matching symbols found for '{}'", symbol);
-        return Ok(());
-    }
-
-    // Get callees with deduplication
-    let traverser = GraphTraverser { queries };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut all_callees: Vec<(codegraph::types::Node, codegraph::types::Edge)> = Vec::new();
-
-    for result in &matches {
-        let callees = traverser.get_callees(&result.node.id, 1).map_err(|e| anyhow::anyhow!("{}", e))?;
-        for (node, edge) in callees {
-            if seen.insert(node.id.clone()) {
-                all_callees.push((node, edge));
-            }
-        }
-    }
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
+    let callees = service.callees(symbol, limit)?;
 
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
-            "callees": all_callees.iter().take(limit).map(|(node, edge)| {
+            "callees": callees.iter().take(limit).map(|(node, edge)| {
                 serde_json::json!({
                     "name": node.name,
                     "filePath": node.file_path,
@@ -820,92 +725,42 @@ fn cmd_callees(path: &str, symbol: &str, limit: usize, json: bool) -> anyhow::Re
                     "edgeKind": edge.kind.as_str(),
                 })
             }).collect::<Vec<_>>(),
-            "total": all_callees.len(),
+            "total": callees.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        if all_callees.is_empty() {
-            println!("No callees found for '{}'", symbol);
-        } else {
-            println!("Callees of '{}' ({}):", symbol, all_callees.len());
-            for (node, _) in all_callees.iter().take(limit) {
-                println!("  - {} ({}) at {}:{}", node.name, node.kind.as_str(), node.file_path, node.start_line);
-            }
-        }
+        let visible_callees = callees.iter().take(limit).cloned().collect::<Vec<_>>();
+        print!(
+            "{}",
+            codegraph::query_service::QueryService::render_graph_list(
+                &format!("Callees of '{}'", symbol),
+                &visible_callees,
+                callees.len(),
+            )
+        );
     }
 
     Ok(())
 }
 
 fn cmd_impact(path: &str, symbol: &str, depth: usize, json: bool) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-    use codegraph::core::query::GraphTraverser;
-    use std::collections::{HashSet, BTreeMap};
+    use std::collections::BTreeMap;
 
-    // Clamp depth to 1-10 range (matching TS behavior)
     let depth = depth.max(1).min(10);
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
-
-    // Search for symbol first
-    let options = codegraph::types::SearchOptions { limit: 50, kinds: None, file_pattern: None };
-    let results = queries.search_nodes(symbol, Some(&options))?;
-
-    // Filter to exact name matches
-    let exact_matches: Vec<_> = results.iter().filter(|r| {
-        r.node.name == symbol
-            || r.node.qualified_name.ends_with(&format!("::{}", symbol))
-            || r.node.name.ends_with(&format!(".{}", symbol))
-    }).collect();
-
-    let matches: Vec<_> = if exact_matches.is_empty() {
-        results.iter().take(1).collect()
-    } else {
-        exact_matches
-    };
-
-    if matches.is_empty() {
-        println!("No matching symbols found for '{}'", symbol);
-        return Ok(());
-    }
-
-    // Merge impact subgraphs from all matching symbols
-    let traverser = GraphTraverser { queries };
-    let mut merged = codegraph::types::Subgraph::new();
-    let mut edge_seen: HashSet<(String, String, String)> = HashSet::new();
-
-    for result in &matches {
-        let impact = traverser.get_impact_radius(&result.node.id, depth)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        for (id, node) in impact.nodes {
-            merged.nodes.entry(id).or_insert(node);
-        }
-        for edge in impact.edges {
-            let key = (edge.source.clone(), edge.target.clone(), edge.kind.as_str().to_string());
-            if edge_seen.insert(key) {
-                merged.edges.push(edge);
-            }
-        }
-    }
-
-    // Collect nodes (exclude the symbol nodes themselves)
-    let match_ids: HashSet<&str> = matches.iter().map(|r| r.node.id.as_str()).collect();
-    let affected_nodes: Vec<&codegraph::types::Node> = merged.nodes.values()
-        .filter(|n| !match_ids.contains(n.id.as_str()))
-        .collect();
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
+    let summary = service.impact_summary(symbol, depth)?;
+    let edge_count = summary.edge_count;
+    let affected_nodes = summary.affected;
 
     if json {
         let output = serde_json::json!({
             "symbol": symbol,
             "depth": depth,
             "nodeCount": affected_nodes.len(),
-            "edgeCount": merged.edges.len(),
+            "edgeCount": edge_count,
             "affected": affected_nodes.iter().map(|node| {
                 serde_json::json!({
                     "name": node.name,
@@ -920,12 +775,11 @@ fn cmd_impact(path: &str, symbol: &str, depth: usize, json: bool) -> anyhow::Res
         if affected_nodes.is_empty() {
             println!("No impact found for '{}'", symbol);
         } else {
-            // Group by file
             let mut by_file: BTreeMap<&str, Vec<&codegraph::types::Node>> = BTreeMap::new();
             for node in &affected_nodes {
                 by_file.entry(node.file_path.as_str()).or_default().push(node);
             }
-            println!("Impact of changing \"{}\" — {} affected symbols:", symbol, affected_nodes.len());
+            println!("Impact of changing \"{}\" - {} affected symbols:", symbol, affected_nodes.len());
             for (file, nodes) in &by_file {
                 println!("  {}:", file);
                 for node in nodes {
@@ -1011,13 +865,16 @@ fn cmd_files(
     use std::collections::BTreeMap;
     use globset::Glob;
 
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized. Run 'codegraph init' first.");
-    }
-
-    let db_path = codegraph::db::get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
     let queries = QueryBuilder::new(db.get_conn());
+
+    if json {
+        let service = codegraph::query_service::QueryService::new(project, queries);
+        let output = service.list_files(filter, pattern, !no_metadata)?;
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
 
     // Get files from database
     let all_files = queries.get_all_files()?;
@@ -1047,27 +904,6 @@ fn cmd_files(
     }).collect();
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
-
-    if json {
-        let files_json: Vec<_> = files.iter().map(|f| {
-            let mut obj = serde_json::json!({
-                "path": f.path,
-            });
-            if !no_metadata {
-                obj["language"] = serde_json::json!(f.language.as_str());
-                obj["node_count"] = serde_json::json!(f.node_count);
-                obj["size"] = serde_json::json!(f.size);
-            }
-            obj
-        }).collect();
-        let output = serde_json::json!({
-            "root": path,
-            "files": files_json,
-            "count": files.len(),
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(());
-    }
 
     match format {
         "flat" => {
@@ -1195,77 +1031,13 @@ fn build_file_tree(
 }
 
 fn cmd_explore(path: &str, query: &[String], max_files: usize) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-    use codegraph::core::query::GraphTraverser;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
-
     let search_query = query.join(" ");
-    let options = codegraph::types::SearchOptions::default();
-    let results = queries.search_nodes(&search_query, Some(&options))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
 
-    if results.is_empty() {
-        println!("No results found for '{}'", search_query);
-        return Ok(());
-    }
-
-    println!("Exploring '{}':\n", search_query);
-
-    let traverser = GraphTraverser { queries };
-
-    let mut files_shown = 0;
-
-    for result in results.iter() {
-        if files_shown >= max_files {
-            break;
-        }
-
-        let node = &result.node;
-        println!("=== {} ({}) ===", node.name, node.kind.as_str());
-        println!("  File: {}:{}", node.file_path, node.start_line);
-
-        // Show callers and callees
-        if let Ok(callers) = traverser.get_callers(&node.id, 1) {
-            if !callers.is_empty() {
-                println!("  Called by:");
-                for (caller, _) in callers.iter().take(5) {
-                    println!("    - {} ({}) at {}:{}", caller.name, caller.kind.as_str(), caller.file_path, caller.start_line);
-                }
-            }
-        }
-        if let Ok(callees) = traverser.get_callees(&node.id, 1) {
-            if !callees.is_empty() {
-                println!("  Calls:");
-                for (callee, _) in callees.iter().take(5) {
-                    println!("    - {} ({}) at {}:{}", callee.name, callee.kind.as_str(), callee.file_path, callee.start_line);
-                }
-            }
-        }
-
-        // Try to read source
-        let full_path = std::path::Path::new(path).join(&node.file_path);
-        if let Ok(content) = codegraph::util::read_file_content(&full_path) {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = (node.start_line as usize).saturating_sub(2);
-            let end = (node.end_line as usize + 2).min(lines.len());
-
-            println!("  Source (lines {}-{}):", start + 1, end);
-            for i in start..end {
-                let line_num = i + 1;
-                let marker = if line_num == node.start_line as usize { ">" } else { " " };
-                println!("  {} {:4} | {}", marker, line_num, lines[i]);
-            }
-            files_shown += 1;
-        }
-        println!();
-    }
-
+    print!("{}", service.render_explore_text(&search_query, max_files)?);
     Ok(())
 }
 
@@ -1277,49 +1049,25 @@ fn cmd_node(
     limit: Option<usize>,
     symbols_only: bool,
 ) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
-    use std::path::Path;
-
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-    let queries = QueryBuilder::new(db.get_conn());
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
+    let service =
+        codegraph::query_service::QueryService::new(project, QueryBuilder::new(db.get_conn()));
 
     // File mode
     if let Some(file_path) = file {
-        let full_path = Path::new(path).join(file_path);
-        let content = codegraph::util::read_file_content(&full_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-
-        let start = offset.unwrap_or(1).saturating_sub(1);
-        let end = limit.map(|l| (start + l).min(lines.len())).unwrap_or(lines.len());
-
         if symbols_only {
-            // Show symbol map for file
-            let options = codegraph::types::SearchOptions {
-                file_pattern: Some(file_path.to_string()),
-                ..Default::default()
-            };
-            let results = queries.search_nodes("", Some(&options))?;
-            println!("Symbols in {}:", file_path);
-            for result in &results {
-                println!("  {} ({}):{}", result.node.name, result.node.kind.as_str(), result.node.start_line);
-            }
+            print!("{}", service.render_symbols_only_text(file_path)?);
         } else {
-            println!("=== {} (lines {}-{}) ===", file_path, start + 1, end);
-            for i in start..end {
-                println!("{:4} | {}", i + 1, lines[i]);
-            }
+            let view = service.file_view(file_path, offset, limit)?;
+            print!("{}", service.render_file_view_text(&view));
         }
         return Ok(());
     }
 
     // Symbol mode
     let options = codegraph::types::SearchOptions::default();
-    let results = queries.search_nodes(name, Some(&options))?;
+    let results = service.queries.search_nodes(name, Some(&options))?;
 
     if results.is_empty() {
         println!("No symbol found: {}", name);
@@ -1334,7 +1082,7 @@ fn cmd_node(
     }
 
     // Read source
-    let full_path = Path::new(path).join(&node.file_path);
+    let full_path = service.project.root.join(&node.file_path);
     if let Ok(content) = codegraph::util::read_file_content(&full_path) {
         let lines: Vec<&str> = content.lines().collect();
         let start = (node.start_line as usize).saturating_sub(1);
@@ -1358,17 +1106,12 @@ fn cmd_affected(
     json: bool,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    use codegraph::db::get_database_path;
+    use globset::Glob;
     use std::collections::{HashSet, VecDeque};
     use std::io::{self, BufRead};
-    use globset::Glob;
 
-    if !codegraph::db::is_initialized(path) {
-        anyhow::bail!("CodeGraph not initialized");
-    }
-
-    let db_path = get_database_path(path);
-    let db = DatabaseConnection::open(&db_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let project = codegraph::project::resolve_project(Some(path))?;
+    let db = project.open_database()?;
     let queries = QueryBuilder::new(db.get_conn());
 
     // Collect files to analyze
@@ -1385,81 +1128,100 @@ fn cmd_affected(
     }
 
     if changed_files.is_empty() {
-        anyhow::bail!("No files specified. Provide files as arguments or use --stdin");
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "changedFiles": [],
+                    "affectedTests": [],
+                    "totalDependentsTraversed": 0,
+                }))?
+            );
+        } else if !quiet {
+            println!("No files provided. Use file arguments or --stdin.");
+        }
+        return Ok(());
     }
 
     // Build test file matcher
     let default_test_patterns = [
-        ".spec.", ".test.", "/__tests__/", "/tests?/", "/e2e/", "/spec/"
+        ".spec.",
+        ".test.",
+        "/__tests__/",
+        "/test/",
+        "/tests/",
+        "/e2e/",
+        "/spec/",
     ];
+    let custom_matcher = filter
+        .and_then(|filter_glob| Glob::new(filter_glob).ok())
+        .map(|glob| glob.compile_matcher());
     let is_test_file = |file_path: &str| -> bool {
-        if let Some(filter_glob) = filter {
-            if let Ok(glob) = Glob::new(filter_glob) {
-                if glob.compile_matcher().is_match(file_path) {
-                    return true;
-                }
-            }
+        if let Some(matcher) = &custom_matcher {
+            return matcher.is_match(file_path);
         }
-        default_test_patterns.iter().any(|pat| file_path.contains(pat))
+        let normalized = file_path.replace('\\', "/");
+        default_test_patterns
+            .iter()
+            .any(|pat| normalized.contains(pat))
     };
 
     // BFS on file-level dependency graph
-    let mut affected: HashSet<String> = HashSet::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut affected_tests: HashSet<String> = HashSet::new();
+    let mut all_dependents: HashSet<String> = HashSet::new();
 
-    // Seed BFS with changed files
     for file in &changed_files {
         let rel = file.clone();
         if is_test_file(&rel) {
-            affected.insert(rel.clone());
-        }
-        if visited.insert(rel.clone()) {
-            queue.push_back((rel, 0));
-        }
-    }
-
-    // BFS traversal
-    while let Some((current_file, current_depth)) = queue.pop_front() {
-        if current_depth >= depth {
+            affected_tests.insert(rel);
             continue;
         }
 
-        if let Ok(dependents) = queries.get_file_dependents(&current_file) {
-            for dep_file in dependents {
-                if !visited.insert(dep_file.clone()) {
-                    continue;
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        visited.insert(rel.clone());
+        queue.push_back((rel, 0));
+
+        while let Some((current_file, current_depth)) = queue.pop_front() {
+            if current_depth >= depth {
+                continue;
+            }
+
+            if let Ok(dependents) = queries.get_file_dependents(&current_file) {
+                for dep_file in dependents {
+                    if !visited.insert(dep_file.clone()) {
+                        continue;
+                    }
+                    all_dependents.insert(dep_file.clone());
+                    if is_test_file(&dep_file) {
+                        affected_tests.insert(dep_file);
+                    } else {
+                        queue.push_back((dep_file, current_depth + 1));
+                    }
                 }
-                if is_test_file(&dep_file) {
-                    affected.insert(dep_file.clone());
-                }
-                queue.push_back((dep_file, current_depth + 1));
             }
         }
     }
 
-    let mut affected_files: Vec<String> = affected.into_iter().collect();
-    affected_files.sort();
-    let total_affected = affected_files.len();
-    let _affected_refs: Vec<&String> = affected_files.iter().collect();
-    // For JSON output
-    let _affected_slice = affected_files.clone();
+    let mut affected_tests: Vec<String> = affected_tests.into_iter().collect();
+    affected_tests.sort();
 
     if json {
         let output = serde_json::json!({
-            "changed": changed_files,
-            "affected": affected_files,
-            "count": total_affected,
+            "changedFiles": changed_files,
+            "affectedTests": affected_tests,
+            "totalDependentsTraversed": all_dependents.len(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if quiet {
-        for file in &affected_files {
+        for file in &affected_tests {
             println!("{}", file);
         }
+    } else if affected_tests.is_empty() {
+        println!("No test files affected by the changed files.");
     } else {
-        println!("Changed files: {}", changed_files.len());
-        println!("Affected files: {}", total_affected);
-        for file in &affected_files {
+        println!("Affected test files ({}):", affected_tests.len());
+        for file in &affected_tests {
             println!("  {}", file);
         }
     }
@@ -1474,13 +1236,16 @@ fn cmd_install(
     no_permissions: bool,
     print_config: Option<&str>,
 ) -> anyhow::Result<()> {
-    println!("Install command - Agent installation not yet implemented");
-    println!("  Target: {:?}", target);
-    println!("  Location: {:?}", location);
-    println!("  Yes: {}", yes);
-    println!("  No permissions: {}", no_permissions);
-    println!("  Print config: {:?}", print_config);
-    println!("\nFor now, manually add MCP server config to your AI agent.");
+    let location = codegraph::installer::Location::parse(location)?;
+    if let Some(target) = print_config {
+        print!("{}", codegraph::installer::print_config(target, location)?);
+        return Ok(());
+    }
+
+    let auto_allow = if no_permissions { false } else { yes };
+    for report in codegraph::installer::install(target, location, auto_allow)? {
+        println!("{}", report);
+    }
     Ok(())
 }
 
@@ -1489,10 +1254,13 @@ fn cmd_uninstall(
     location: Option<&str>,
     yes: bool,
 ) -> anyhow::Result<()> {
-    println!("Uninstall command - Agent uninstallation not yet implemented");
-    println!("  Target: {:?}", target);
-    println!("  Location: {:?}", location);
-    println!("  Yes: {}", yes);
+    let location = codegraph::installer::Location::parse(location)?;
+    if !yes && target.is_none() && location == codegraph::installer::Location::Global {
+        println!("Uninstalling all global CodeGraph agent entries.");
+    }
+    for report in codegraph::installer::uninstall(target, location)? {
+        println!("{}", report);
+    }
     Ok(())
 }
 
