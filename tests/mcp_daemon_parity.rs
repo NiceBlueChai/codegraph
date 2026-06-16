@@ -64,6 +64,20 @@ fn read_pidfile(project: &Path) -> serde_json::Value {
     }
 }
 
+fn wait_for_pidfile_removed(project: &Path) {
+    let path = project.join(".codegraph").join("daemon.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if !path.exists() {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("timed out waiting for pidfile removal: {}", path.display());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn initialize_over_tcp(addr: &str) -> serde_json::Value {
     let stream = TcpStream::connect(addr).expect("connect daemon");
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -100,6 +114,10 @@ fn initialize_over_tcp(addr: &str) -> serde_json::Value {
 }
 
 fn initialize_over_stdio(project: &Path) -> serde_json::Value {
+    initialize_over_stdio_with_env(project, &[])
+}
+
+fn initialize_over_stdio_with_env(project: &Path, envs: &[(&str, &str)]) -> serde_json::Value {
     let input = format!(
         "{}\n{}\n",
         serde_json::json!({
@@ -114,14 +132,17 @@ fn initialize_over_stdio(project: &Path) -> serde_json::Value {
         }),
         serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
     );
-    let mut child = Command::new(codegraph_bin())
+    let mut command = Command::new(codegraph_bin());
+    command
         .args(["serve", "--mcp", "--path"])
         .arg(project)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mcp proxy");
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("spawn mcp proxy");
     let stdout = child.stdout.take().expect("stdout");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -162,6 +183,21 @@ fn stop_pid(pid: &serde_json::Value) {
     }
 }
 
+fn write_pidfile(project: &Path, pid: u32, version: &str, addr: &str) {
+    let path = project.join(".codegraph").join("daemon.pid");
+    fs::write(
+        path,
+        serde_json::json!({
+            "pid": pid,
+            "version": version,
+            "addr": addr,
+            "startedAt": 1,
+        })
+        .to_string(),
+    )
+    .expect("write pidfile");
+}
+
 #[test]
 fn hidden_daemon_mode_answers_initialize() {
     let project = fixture_project();
@@ -189,4 +225,52 @@ fn two_mcp_launchers_share_one_daemon() {
 
     stop_pid(&second_pid);
     assert_eq!(first_pid, second_pid);
+}
+
+#[test]
+fn no_daemon_env_uses_direct_mode_without_pidfile() {
+    let project = fixture_project();
+
+    let response = initialize_over_stdio_with_env(project.path(), &[("CODEGRAPH_NO_DAEMON", "1")]);
+
+    assert_eq!(response["result"]["serverInfo"]["name"], "CodeGraph");
+    assert!(!project.path().join(".codegraph").join("daemon.pid").exists());
+}
+
+#[test]
+fn stale_pidfile_is_replaced() {
+    let project = fixture_project();
+    write_pidfile(project.path(), 999_999, env!("CARGO_PKG_VERSION"), "127.0.0.1:1");
+
+    let response = initialize_over_stdio(project.path());
+    let pid = read_pidfile(project.path())["pid"].clone();
+
+    stop_pid(&pid);
+    assert_eq!(response["result"]["serverInfo"]["name"], "CodeGraph");
+    assert_ne!(pid, serde_json::json!(999_999));
+}
+
+#[test]
+fn version_mismatch_falls_back_to_direct_mode() {
+    let project = fixture_project();
+    write_pidfile(project.path(), std::process::id(), "0.0.0-old", "127.0.0.1:1");
+
+    let response = initialize_over_stdio(project.path());
+    let pidfile = read_pidfile(project.path());
+
+    assert_eq!(response["result"]["serverInfo"]["name"], "CodeGraph");
+    assert_eq!(pidfile["version"], "0.0.0-old");
+}
+
+#[test]
+fn daemon_idle_timeout_removes_pidfile() {
+    let project = fixture_project();
+
+    let response = initialize_over_stdio_with_env(
+        project.path(),
+        &[("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", "200")],
+    );
+
+    assert_eq!(response["result"]["serverInfo"]["name"], "CodeGraph");
+    wait_for_pidfile_removed(project.path());
 }

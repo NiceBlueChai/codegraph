@@ -26,6 +26,12 @@ pub fn run(project: ProjectContext) -> anyhow::Result<()> {
 }
 
 fn connect_or_spawn(project: &ProjectContext) -> anyhow::Result<TcpStream> {
+    if let Ok(info) = read_daemon_lock(daemon_pid_path(&project.root)) {
+        if info.version != env!("CARGO_PKG_VERSION") && pid_is_alive(info.pid) {
+            anyhow::bail!("daemon version mismatch");
+        }
+    }
+
     if let Ok(stream) = connect_existing(project) {
         return Ok(stream);
     }
