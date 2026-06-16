@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,9 +99,67 @@ fn initialize_over_tcp(addr: &str) -> serde_json::Value {
     serde_json::from_str(&response).expect("initialize response json")
 }
 
+fn initialize_over_stdio(project: &Path) -> serde_json::Value {
+    let input = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "proxy-test", "version": "0.0.0"}
+            }
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    );
+    let mut child = Command::new(codegraph_bin())
+        .args(["serve", "--mcp", "--path"])
+        .arg(project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp proxy");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line).map(|_| line);
+        let _ = tx.send(result);
+    });
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(input.as_bytes()).expect("write stdin");
+    stdin.flush().expect("flush stdin");
+    drop(stdin);
+    let line = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("read initialize response before timeout")
+        .expect("read initialize response");
+    stop_child(child);
+    serde_json::from_str(&line).expect("initialize response json")
+}
+
 fn stop_child(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn stop_pid(pid: &serde_json::Value) {
+    if let Some(pid) = pid.as_u64() {
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
 }
 
 #[test]
@@ -114,4 +173,20 @@ fn hidden_daemon_mode_answers_initialize() {
 
     stop_child(daemon);
     assert_eq!(response["result"]["serverInfo"]["name"], "CodeGraph");
+}
+
+#[test]
+fn two_mcp_launchers_share_one_daemon() {
+    let project = fixture_project();
+
+    let first = initialize_over_stdio(project.path());
+    assert_eq!(first["result"]["serverInfo"]["name"], "CodeGraph");
+    let first_pid = read_pidfile(project.path())["pid"].clone();
+
+    let second = initialize_over_stdio(project.path());
+    assert_eq!(second["result"]["serverInfo"]["name"], "CodeGraph");
+    let second_pid = read_pidfile(project.path())["pid"].clone();
+
+    stop_pid(&second_pid);
+    assert_eq!(first_pid, second_pid);
 }

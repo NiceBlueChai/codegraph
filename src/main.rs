@@ -658,6 +658,16 @@ fn cmd_serve(path: Option<&str>, mcp: bool, mcp_daemon: bool, no_watch: bool) ->
                 return Ok(());
             }
         };
+
+        if std::env::var("CODEGRAPH_NO_DAEMON").ok().as_deref() != Some("1") {
+            match codegraph::mcp::proxy::run(project.clone()) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    log::debug!("Falling back to direct MCP mode: {}", error);
+                }
+            }
+        }
+
         let db = project.open_database()?;
         let queries = QueryBuilder::new(db.get_conn());
 
