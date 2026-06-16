@@ -1,3 +1,4 @@
+pub mod daemon;
 pub mod daemon_paths;
 pub mod protocol;
 pub mod server;

@@ -98,6 +98,10 @@ enum Commands {
         #[arg(long)]
         mcp: bool,
 
+        /// Run the hidden project daemon listener.
+        #[arg(long, hide = true)]
+        mcp_daemon: bool,
+
         /// Disable file watcher (no auto-sync; slower filesystems like WSL2 /mnt)
         #[arg(long)]
         no_watch: bool,
@@ -353,9 +357,9 @@ fn main() -> anyhow::Result<()> {
             info!("Querying at {}: {}", path, query);
             cmd_query(&path, &query, limit, kind.as_deref(), json)?;
         }
-        Some(Commands::Serve { path, mcp, no_watch }) => {
+        Some(Commands::Serve { path, mcp, mcp_daemon, no_watch }) => {
             info!("Starting MCP server (mcp={})", mcp);
-            cmd_serve(path.as_deref(), mcp, no_watch)?;
+            cmd_serve(path.as_deref(), mcp, mcp_daemon, no_watch)?;
         }
         Some(Commands::Callers { symbol, path, limit, json }) => {
             info!("Finding callers of '{}' at {}", symbol, path);
@@ -637,7 +641,12 @@ fn cmd_query(path: &str, query: &str, limit: usize, kind: Option<&str>, json: bo
     Ok(())
 }
 
-fn cmd_serve(path: Option<&str>, mcp: bool, no_watch: bool) -> anyhow::Result<()> {
+fn cmd_serve(path: Option<&str>, mcp: bool, mcp_daemon: bool, no_watch: bool) -> anyhow::Result<()> {
+    if mcp_daemon {
+        let project = codegraph::project::resolve_project(path)?;
+        return codegraph::mcp::daemon::run_daemon(project);
+    }
+
     if mcp {
         let project = match codegraph::project::resolve_project(path) {
             Ok(project) => project,
