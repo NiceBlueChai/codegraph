@@ -1,3 +1,5 @@
+//! Reference resolution from extracted symbol references to graph edges.
+
 use crate::db::QueryBuilder;
 use crate::types::*;
 use log::{debug, info};
@@ -71,17 +73,26 @@ impl ResolutionContext {
 
     /// Get candidates from the same language family
     fn get_family_candidates(&self, lang: &Language, name: &str) -> Vec<&Node> {
+        let name_lower = name.to_lowercase();
         if let Some(family) = get_language_family(lang) {
             if let Some(nodes) = self.nodes_by_family.get(family) {
-                let name_lower = name.to_lowercase();
                 return nodes.iter().filter(|n| n.name.to_lowercase() == name_lower).collect();
             }
         }
-        // If no family or no match, return all candidates with this name
-        self.nodes_by_name
+
+        let candidates = self
+            .nodes_by_name
             .get(&name.to_lowercase())
             .map(|v| v.iter().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if *lang == Language::Unknown {
+            return candidates;
+        }
+
+        candidates
+            .into_iter()
+            .filter(|node| node.language == *lang)
+            .collect()
     }
 }
 
@@ -182,7 +193,12 @@ impl<'a> Resolver<'a> {
     }
 
     /// Strategy 2: Match by qualified name (e.g., "com.example.Foo", "std::vec::Vec")
-    fn match_by_qualified_name(&self, uref: &UnresolvedReference, ctx: &ResolutionContext, lang: &Language) -> Option<ResolvedReference> {
+    fn match_by_qualified_name(
+        &self,
+        uref: &UnresolvedReference,
+        ctx: &ResolutionContext,
+        lang: &Language,
+    ) -> Option<ResolvedReference> {
         let ref_name = &uref.reference_name;
 
         // Try exact qualified name match
@@ -207,7 +223,12 @@ impl<'a> Resolver<'a> {
     }
 
     /// Strategy 3: Match method call patterns (obj.method, Class::method)
-    fn match_method_call(&self, uref: &UnresolvedReference, ctx: &ResolutionContext, lang: &Language) -> Option<ResolvedReference> {
+    fn match_method_call(
+        &self,
+        uref: &UnresolvedReference,
+        ctx: &ResolutionContext,
+        lang: &Language,
+    ) -> Option<ResolvedReference> {
         let ref_name = &uref.reference_name;
 
         // Parse method call patterns
@@ -243,7 +264,12 @@ impl<'a> Resolver<'a> {
     }
 
     /// Strategy 4: Exact name match within language family
-    fn match_by_exact_name(&self, uref: &UnresolvedReference, ctx: &ResolutionContext, lang: &Language) -> Option<ResolvedReference> {
+    fn match_by_exact_name(
+        &self,
+        uref: &UnresolvedReference,
+        ctx: &ResolutionContext,
+        lang: &Language,
+    ) -> Option<ResolvedReference> {
         let ref_name = &uref.reference_name;
 
         let candidates = ctx.get_family_candidates(lang, ref_name);
@@ -279,7 +305,12 @@ impl<'a> Resolver<'a> {
     }
 
     /// Strategy 5: Fuzzy match (substring or case-insensitive)
-    fn match_fuzzy(&self, uref: &UnresolvedReference, ctx: &ResolutionContext, lang: &Language) -> Option<ResolvedReference> {
+    fn match_fuzzy(
+        &self,
+        uref: &UnresolvedReference,
+        ctx: &ResolutionContext,
+        lang: &Language,
+    ) -> Option<ResolvedReference> {
         let ref_name_lower = uref.reference_name.to_lowercase();
 
         // Try substring match
@@ -306,9 +337,13 @@ impl<'a> Resolver<'a> {
 
     /// Check if two languages belong to the same family
     fn same_language_family(&self, lang1: &Language, lang2: &Language) -> bool {
+        if *lang1 == Language::Unknown || *lang2 == Language::Unknown {
+            return true;
+        }
         match (get_language_family(lang1), get_language_family(lang2)) {
             (Some(f1), Some(f2)) => f1 == f2,
-            (None, _) | (_, None) => true, // Unknown family allows cross-language
+            (None, None) => lang1 == lang2,
+            (None, _) | (_, None) => false,
         }
     }
 
@@ -384,5 +419,62 @@ mod tests {
         assert_eq!(get_language_family(&Language::Kotlin), Some("jvm"));
         assert_eq!(get_language_family(&Language::TypeScript), Some("web"));
         assert_eq!(get_language_family(&Language::Python), None);
+    }
+
+    #[test]
+    fn python_reference_does_not_resolve_to_c_symbol_with_same_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = format!("{}/test.db", temp_dir.path().display());
+
+        let db = Box::new(DatabaseConnection::initialize(&db_path).unwrap());
+        initialize_schema(db.get_conn()).unwrap();
+        let db: &'static DatabaseConnection = Box::leak(db);
+        let queries = QueryBuilder::new(db.get_conn());
+        let python_caller = Node::new(
+            "app.py::caller#1".to_string(),
+            NodeKind::Function,
+            "caller".to_string(),
+            "app.py::caller".to_string(),
+            "app.py".to_string(),
+            Language::Python,
+            1,
+            3,
+            0,
+            10,
+        );
+        let c_shared = Node::new(
+            "lib.c::shared#1".to_string(),
+            NodeKind::Function,
+            "shared".to_string(),
+            "lib.c::shared".to_string(),
+            "lib.c".to_string(),
+            Language::C,
+            1,
+            3,
+            0,
+            10,
+        );
+        queries.insert_node(&python_caller).expect("insert python caller");
+        queries.insert_node(&c_shared).expect("insert c shared");
+
+        let resolver = Resolver::new(queries);
+        let refs = vec![UnresolvedReference {
+            id: Some(0),
+            from_node_id: python_caller.id,
+            reference_name: "shared".to_string(),
+            reference_kind: "call".to_string(),
+            line: 2,
+            col: 4,
+            candidates: None,
+            file_path: "app.py".to_string(),
+            language: "python".to_string(),
+        }];
+
+        let resolved = resolver.resolve_all(&refs).expect("resolve refs");
+
+        assert!(
+            resolved.is_empty(),
+            "python call should not resolve to same-named C symbol: {resolved:?}"
+        );
     }
 }

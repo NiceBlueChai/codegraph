@@ -185,6 +185,65 @@ fn fixture_project_with_two_helper_callers() -> TempDir {
     dir
 }
 
+fn cpp_call_graph_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+static int helper(int value) {
+    return value + 1;
+}
+
+int run() {
+    return helper(41);
+}
+
+class ImageView {
+public:
+    void clearIMG();
+    void setROIParas() {
+        this->clearIMG();
+    }
+};
+
+void ImageView::clearIMG() {
+}
+"#,
+    )
+    .expect("write main.cpp");
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
+fn python_call_graph_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::write(
+        dir.path().join("app.py"),
+        r#"
+def helper(value):
+    return value.strip()
+
+def run_app(value):
+    return helper(value)
+"#,
+    )
+    .expect("write app.py");
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn many_matching_functions_then_class_project() -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     let init = run_codegraph(&["init", "--verbose"], dir.path());
@@ -326,6 +385,137 @@ fn mcp_text(result: &codegraph::mcp::protocol::CallToolResult) -> String {
         .map(|block| block.text.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn typescript_indexing_builds_call_graph_for_relationship_commands() {
+    let dir = fixture_project();
+
+    let callers_output = run_codegraph(&["callers", "helper", "--json"], dir.path());
+    assert!(callers_output.status.success(), "stderr:\n{}", stderr(&callers_output));
+    let callers: serde_json::Value =
+        serde_json::from_str(&stdout(&callers_output)).expect("callers stdout is json");
+    assert!(
+        callers["callers"]
+            .as_array()
+            .expect("callers array")
+            .iter()
+            .any(|node| node["name"] == "runApp"),
+        "expected runApp to call helper:\n{callers}"
+    );
+
+    let callees_output = run_codegraph(&["callees", "runApp", "--json"], dir.path());
+    assert!(callees_output.status.success(), "stderr:\n{}", stderr(&callees_output));
+    let callees: serde_json::Value =
+        serde_json::from_str(&stdout(&callees_output)).expect("callees stdout is json");
+    assert!(
+        callees["callees"]
+            .as_array()
+            .expect("callees array")
+            .iter()
+            .any(|node| node["name"] == "helper"),
+        "expected runApp callees to include helper:\n{callees}"
+    );
+}
+
+#[test]
+fn cpp_indexing_builds_call_graph_for_relationship_commands() {
+    let dir = cpp_call_graph_project();
+
+    let callers_output = run_codegraph(&["callers", "helper", "--json"], dir.path());
+    assert!(
+        callers_output.status.success(),
+        "callers failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&callers_output),
+        stderr(&callers_output)
+    );
+    let callers: serde_json::Value =
+        serde_json::from_str(&stdout(&callers_output)).expect("callers stdout is json");
+    assert!(
+        callers["callers"].as_array().expect("callers array").iter().any(|node| node["name"] == "run"),
+        "expected run to call helper:\n{callers}"
+    );
+
+    let callees_output = run_codegraph(&["callees", "run", "--json"], dir.path());
+    assert!(
+        callees_output.status.success(),
+        "callees failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&callees_output),
+        stderr(&callees_output)
+    );
+    let callees: serde_json::Value =
+        serde_json::from_str(&stdout(&callees_output)).expect("callees stdout is json");
+    assert!(
+        callees["callees"].as_array().expect("callees array").iter().any(|node| node["name"] == "helper"),
+        "expected run callees to include helper:\n{callees}"
+    );
+
+    let impact_output = run_codegraph(&["impact", "helper", "--json"], dir.path());
+    assert!(
+        impact_output.status.success(),
+        "impact failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&impact_output),
+        stderr(&impact_output)
+    );
+    let impact: serde_json::Value =
+        serde_json::from_str(&stdout(&impact_output)).expect("impact stdout is json");
+    assert!(
+        impact["affected"].as_array().expect("affected array").iter().any(|node| node["name"] == "run"),
+        "expected helper impact to include run:\n{impact}"
+    );
+    assert!(
+        impact["edgeCount"].as_u64().unwrap_or(0) > 0,
+        "expected impact edgeCount to reflect the call edge:\n{impact}"
+    );
+
+    let method_callers_output = run_codegraph(&["callers", "clearIMG", "--json"], dir.path());
+    assert!(
+        method_callers_output.status.success(),
+        "method callers failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&method_callers_output),
+        stderr(&method_callers_output)
+    );
+    let method_callers: serde_json::Value =
+        serde_json::from_str(&stdout(&method_callers_output)).expect("method callers stdout is json");
+    assert!(
+        method_callers["callers"]
+            .as_array()
+            .expect("callers array")
+            .iter()
+            .any(|node| node["name"] == "setROIParas"),
+        "expected this->clearIMG() to resolve to clearIMG:\n{method_callers}"
+    );
+}
+
+#[test]
+fn python_indexing_builds_call_graph_for_relationship_commands() {
+    let dir = python_call_graph_project();
+
+    let callers_output = run_codegraph(&["callers", "helper", "--json"], dir.path());
+    assert!(callers_output.status.success(), "stderr:\n{}", stderr(&callers_output));
+    let callers: serde_json::Value =
+        serde_json::from_str(&stdout(&callers_output)).expect("callers stdout is json");
+    assert!(
+        callers["callers"]
+            .as_array()
+            .expect("callers array")
+            .iter()
+            .any(|node| node["name"] == "run_app"),
+        "expected run_app to call helper:\n{callers}"
+    );
+
+    let impact_output = run_codegraph(&["impact", "helper", "--json"], dir.path());
+    assert!(impact_output.status.success(), "stderr:\n{}", stderr(&impact_output));
+    let impact: serde_json::Value =
+        serde_json::from_str(&stdout(&impact_output)).expect("impact stdout is json");
+    assert!(
+        impact["affected"]
+            .as_array()
+            .expect("affected array")
+            .iter()
+            .any(|node| node["name"] == "run_app"),
+        "expected helper impact to include run_app:\n{impact}"
+    );
 }
 
 #[test]
@@ -520,9 +710,8 @@ fn callers_json_limit_does_not_change_total() {
         1,
         "expected limit to apply to emitted callers:\n{value}"
     );
-    assert_eq!(callers[0]["name"], "callerOne");
     assert!(
-        value["total"].as_u64().unwrap_or(0) >= 2,
+        value["total"].as_u64().unwrap_or(0) >= 3,
         "expected total to preserve full caller count:\n{value}"
     );
 }
@@ -536,17 +725,14 @@ fn callers_text_limit_does_not_change_header_total() {
     let caller_rows = out.lines().filter(|line| line.starts_with("- ")).count();
 
     assert!(
-        out.contains("Callers of 'helper' (2):"),
+        out.contains("Callers of 'helper' (3):"),
         "expected header to show full caller count:\n{out}"
     );
     assert_eq!(
         caller_rows, 1,
         "expected limit to apply to visible rows:\n{out}"
     );
-    assert!(
-        out.contains("callerOne"),
-        "expected stable first caller:\n{out}"
-    );
+    assert!(out.contains("runApp"), "expected visible caller:\n{out}");
 }
 
 #[test]

@@ -1,6 +1,8 @@
-use tree_sitter::{Parser, Node as TSTreeSitterNode};
+//! Tree-sitter AST extraction for languages with native grammar support.
+
 use crate::types::*;
 use log::debug;
+use tree_sitter::{Node as TSTreeSitterNode, Parser};
 
 /// Tree-sitter based code parser providing accurate AST extraction
 pub struct TreeSitterParser {
@@ -161,6 +163,11 @@ impl TreeSitterParser {
             // Call expressions (for call edges)
             "call_expression" => {
                 self.extract_call(node, source, file_path, lang, result);
+            }
+            "call" => {
+                if *lang == Language::Python {
+                    self.extract_call(node, source, file_path, lang, result);
+                }
             }
 
             _ => {}
@@ -644,7 +651,7 @@ impl TreeSitterParser {
         node: TSTreeSitterNode,
         source: &str,
         file_path: &str,
-        _lang: &Language,
+        lang: &Language,
         result: &mut ExtractionResult,
     ) {
         let func_node = node.child_by_field_name("function");
@@ -652,7 +659,7 @@ impl TreeSitterParser {
             let callee = self.get_node_text(func, source);
             if !callee.is_empty() {
                 // Try to find parent function
-                let caller_id = self.find_enclosing_function_id(node, file_path);
+                let caller_id = self.find_enclosing_function_id(node, source, file_path);
                 if let Some(caller) = caller_id {
                     // Create unresolved ref for resolution
                     let uref = UnresolvedReference {
@@ -664,7 +671,7 @@ impl TreeSitterParser {
                         col: node.start_position().column as u32,
                         candidates: None,
                         file_path: file_path.to_string(),
-                        language: "unknown".to_string(),
+                        language: lang.as_str().to_string(),
                     };
                     result.unresolved_refs.push(uref);
                 }
@@ -676,6 +683,7 @@ impl TreeSitterParser {
     fn find_enclosing_function_id(
         &self,
         node: TSTreeSitterNode,
+        source: &str,
         file_path: &str,
     ) -> Option<String> {
         let mut current = node.parent()?;
@@ -684,7 +692,7 @@ impl TreeSitterParser {
                 "function_declaration" | "function_expression" | "arrow_function"
                 | "method_definition" | "function_item" | "function_definition" => {
                     let name = self
-                        .get_child_text(current, "name", "")
+                        .get_child_text(current, "name", source)
                         .unwrap_or_else(|| "anonymous".to_string());
                     let start = current.start_position();
                     return Some(format!("{}::{}#{}", file_path, name, start.row + 1));
