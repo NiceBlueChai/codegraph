@@ -312,6 +312,22 @@ impl<'a> Resolver<'a> {
 
         if parts.len() >= 2 {
             let method_name = parts.last().unwrap();
+            if matches!(uref.reference_kind.as_str(), "instantiation" | "new") {
+                let candidates = ctx.get_family_candidates(lang, method_name);
+                for candidate in candidates {
+                    if is_type_like_node(&candidate.kind) {
+                        return Some(ResolvedReference {
+                            from_node_id: uref.from_node_id.clone(),
+                            target_node_id: candidate.id.clone(),
+                            edge_kind: self.infer_edge_kind(&uref.reference_kind),
+                            confidence: 0.7,
+                            strategy: ResolutionStrategy::MethodCall,
+                            line: uref.line,
+                            col: uref.col,
+                        });
+                    }
+                }
+            }
 
             // Look for methods with this name in the same language family
             let candidates = ctx.get_family_candidates(lang, method_name);
@@ -459,6 +475,19 @@ impl<'a> Resolver<'a> {
 
         Ok(())
     }
+}
+
+fn is_type_like_node(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Class
+            | NodeKind::Struct
+            | NodeKind::Interface
+            | NodeKind::Trait
+            | NodeKind::Protocol
+            | NodeKind::Enum
+            | NodeKind::TypeAlias
+    )
 }
 
 fn import_path_candidates(base_dir: &str, specifier: &str, lang: &Language) -> Vec<String> {

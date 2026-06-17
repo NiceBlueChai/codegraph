@@ -386,6 +386,69 @@ fn csharp_record_project() -> TempDir {
     dir
 }
 
+fn go_composite_literal_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("render")).expect("create render");
+    fs::write(dir.path().join("go.mod"), "module example.com/proj\n").expect("write go.mod");
+    fs::write(
+        dir.path().join("render").join("xml.go"),
+        "package render\n\ntype XML struct { Data any }\n",
+    )
+    .expect("write xml");
+    fs::write(
+        dir.path().join("app.go"),
+        concat!(
+            "package main\n\n",
+            "import \"example.com/proj/render\"\n\n",
+            "func Build() any {\n",
+            "    return render.XML{}\n",
+            "}\n",
+        ),
+    )
+    .expect("write app");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
+fn go_composite_registry_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("render")).expect("create render");
+    fs::write(dir.path().join("go.mod"), "module example.com/proj\n").expect("write go.mod");
+    fs::write(
+        dir.path().join("render").join("xml.go"),
+        "package render\n\ntype XML struct { Data any }\n",
+    )
+    .expect("write xml");
+    fs::write(
+        dir.path().join("reg.go"),
+        concat!(
+            "package main\n\n",
+            "import \"example.com/proj/render\"\n\n",
+            "type Renderer interface{}\n\n",
+            "var registry = map[string]Renderer{\n",
+            "    \"xml\": render.XML{},\n",
+            "}\n",
+        ),
+    )
+    .expect("write registry");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn single_file_call_graph_project(file_name: &str, source: &str) -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     fs::write(dir.path().join(file_name), source).expect("write source file");
@@ -2148,6 +2211,42 @@ fn affected_follows_csharp_record_references() {
         value["affectedTests"],
         serde_json::json!(["use.cs"]),
         "expected record references to make use.cs affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_go_cross_package_composite_literal() {
+    let dir = go_composite_literal_project();
+    let output = run_codegraph(
+        &["affected", "render/xml.go", "--json", "--depth", "5", "--filter", "app.go"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["app.go"]),
+        "expected render.XML composite literal to make app.go affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_go_package_level_composite_literal() {
+    let dir = go_composite_registry_project();
+    let output = run_codegraph(
+        &["affected", "render/xml.go", "--json", "--depth", "5", "--filter", "reg.go"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["reg.go"]),
+        "expected registry render.XML literal to make reg.go affected:\n{value}"
     );
 }
 

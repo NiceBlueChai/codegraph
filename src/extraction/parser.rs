@@ -37,6 +37,21 @@ static GO_CALL_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid Go call regex")
 });
 
+static GO_TYPE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?m)^[ \t]*type\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<kind>struct|interface)\b"#,
+    )
+    .expect("valid Go type regex")
+});
+
+static GO_COMPOSITE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r#"(?P<name>[A-Za-z_][A-Za-z0-9_]*"#,
+        r#"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)?(?:\s*\[[^\]\n]*\])?)\s*\{"#,
+    ))
+    .expect("valid Go composite literal regex")
+});
+
 static RUBY_METHOD_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?m)^[ \t]*def\s+(?P<name>(?:self\.)?[A-Za-z_][A-Za-z0-9_!?=]*)"#)
         .expect("valid Ruby method regex")
@@ -474,6 +489,9 @@ impl CodeParser {
     fn extract_go(source: &str, file_path: &str, result: &mut ExtractionResult) {
         let masked_source = mask_c_family_noise(source);
         let mut functions = Vec::new();
+        let mut function_ranges = Vec::new();
+
+        Self::extract_go_types(source, file_path, result);
 
         for captures in GO_FUNCTION_RE.captures_iter(&masked_source) {
             let Some(full_match) = captures.get(0) else {
@@ -528,12 +546,23 @@ impl CodeParser {
                 body_start: open_brace + 1,
                 body_end: close_brace,
             });
+            function_ranges.push((full_match.start(), close_brace + 1));
         }
 
-        for function in functions {
+        for function in &functions {
             if function.body_start >= function.body_end || function.body_end > masked_source.len() {
                 continue;
             }
+            push_go_composite_refs(
+                source,
+                &masked_source,
+                file_path,
+                result,
+                &function.id,
+                function.body_start,
+                function.body_end,
+                None,
+            );
             let body = &masked_source[function.body_start..function.body_end];
             for captures in GO_CALL_RE.captures_iter(body) {
                 let Some(callee_match) = captures.name("callee") else {
@@ -557,6 +586,48 @@ impl CodeParser {
                     language: Language::Go.as_str().to_string(),
                 });
             }
+        }
+
+        push_go_composite_refs(
+            source,
+            &masked_source,
+            file_path,
+            result,
+            &format!("{}::[file]", file_path),
+            0,
+            masked_source.len(),
+            Some(&function_ranges),
+        );
+    }
+
+    fn extract_go_types(source: &str, file_path: &str, result: &mut ExtractionResult) {
+        for captures in GO_TYPE_RE.captures_iter(source) {
+            let Some(kind_match) = captures.name("kind") else {
+                continue;
+            };
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let name = name_match.as_str().to_string();
+            let kind = match kind_match.as_str() {
+                "struct" => NodeKind::Struct,
+                _ => NodeKind::Interface,
+            };
+            let (line, col) = byte_position(source, name_match.start());
+            let mut node = Node::new(
+                format!("{}::{}#{}", file_path, name, line),
+                kind,
+                name.clone(),
+                format!("{}::{}", file_path, name),
+                file_path.to_string(),
+                Language::Go,
+                line,
+                line,
+                col,
+                col + name.len() as u32,
+            );
+            node.is_exported = is_go_exported(&name);
+            result.nodes.push(node);
         }
     }
 
@@ -1015,6 +1086,81 @@ fn normalize_go_callee(raw_callee: &str) -> String {
         .to_string()
 }
 
+fn normalize_go_composite_type(raw_type: &str) -> String {
+    let mut normalized = raw_type.split_whitespace().collect::<String>();
+    if let Some((base, _)) = normalized.split_once('[') {
+        normalized = base.to_string();
+    }
+    normalized.trim().to_string()
+}
+
+fn push_go_composite_refs(
+    source: &str,
+    masked_source: &str,
+    file_path: &str,
+    result: &mut ExtractionResult,
+    from_node_id: &str,
+    start: usize,
+    end: usize,
+    excluded_ranges: Option<&[(usize, usize)]>,
+) {
+    if start >= end || end > masked_source.len() {
+        return;
+    }
+
+    let slice = &masked_source[start..end];
+    for captures in GO_COMPOSITE_RE.captures_iter(slice) {
+        let Some(name_match) = captures.name("name") else {
+            continue;
+        };
+        let absolute_start = start + name_match.start();
+        if excluded_ranges.is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|(from, to)| absolute_start >= *from && absolute_start < *to)
+        }) {
+            continue;
+        }
+        if !is_go_named_composite_literal(masked_source, absolute_start) {
+            continue;
+        }
+
+        let name = normalize_go_composite_type(name_match.as_str());
+        if name.is_empty() || is_go_keyword(name.rsplit('.').next().unwrap_or(&name)) {
+            continue;
+        }
+
+        let (line, col) = byte_position(source, absolute_start);
+        result.unresolved_refs.push(UnresolvedReference {
+            id: Some(0),
+            from_node_id: from_node_id.to_string(),
+            reference_name: name,
+            reference_kind: "new".to_string(),
+            line,
+            col,
+            candidates: None,
+            file_path: file_path.to_string(),
+            language: Language::Go.as_str().to_string(),
+        });
+    }
+}
+
+fn is_go_named_composite_literal(source: &str, name_start: usize) -> bool {
+    let Some(previous) = source[..name_start.min(source.len())].chars().next_back() else {
+        return true;
+    };
+    if previous.is_whitespace() {
+        return true;
+    }
+    !matches!(previous, ']' | ')' | '.' | '_' | '0'..='9' | 'A'..='Z' | 'a'..='z')
+}
+
+fn is_go_exported(name: &str) -> bool {
+    name.as_bytes()
+        .first()
+        .is_some_and(|first| first.is_ascii_uppercase())
+}
+
 fn is_go_keyword(name: &str) -> bool {
     matches!(
         name,
@@ -1047,5 +1193,25 @@ mod tests {
     fn test_parse() {
         let r = parse_file("test.ts", "export class Foo {}\nfunction bar() {}");
         assert!(r.nodes.len() >= 3);
+    }
+
+    #[test]
+    fn go_composite_literal_creates_instantiation_ref() {
+        let source = r#"
+package main
+
+func Build() any {
+    return render.XML{}
+}
+"#;
+        let result = parse_file("app.go", source);
+
+        assert!(
+            result.unresolved_refs.iter().any(|reference| {
+                reference.reference_name == "render.XML" && reference.reference_kind == "new"
+            }),
+            "expected render.XML composite ref, got {:?}",
+            result.unresolved_refs
+        );
     }
 }
