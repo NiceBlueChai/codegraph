@@ -69,6 +69,15 @@ static JAVA_ANNOTATION_USE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"@(?P<name>[A-Z][A-Za-z0-9_]*)"#).expect("valid Java annotation usage regex")
 });
 
+static SWIFT_TYPE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)^[ \t]*(?:public\s+)?(?P<kind>struct|class|enum)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"#)
+        .expect("valid Swift type declaration regex")
+});
+
+static SWIFT_ATTRIBUTE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"@(?P<name>[A-Z][A-Za-z0-9_]*)"#).expect("valid Swift attribute regex")
+});
+
 #[derive(Debug, Clone)]
 struct CFamilyFunctionSpan {
     id: String,
@@ -535,6 +544,9 @@ impl CodeParser {
         if lang == Language::Java {
             Self::extract_java_annotations(source, file_path, result);
         }
+        if lang == Language::Swift {
+            Self::extract_swift_types_and_attributes(source, file_path, result);
+        }
 
         for captures in C_FAMILY_FUNCTION_RE.captures_iter(&masked_source) {
             let Some(full_match) = captures.get(0) else {
@@ -655,6 +667,62 @@ impl CodeParser {
                 candidates: None,
                 file_path: file_path.to_string(),
                 language: Language::Java.as_str().to_string(),
+            });
+        }
+    }
+
+    fn extract_swift_types_and_attributes(
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        for captures in SWIFT_TYPE_RE.captures_iter(source) {
+            let Some(kind_match) = captures.name("kind") else {
+                continue;
+            };
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let name = name_match.as_str().to_string();
+            let kind = match kind_match.as_str() {
+                "struct" => NodeKind::Struct,
+                "enum" => NodeKind::Enum,
+                _ => NodeKind::Class,
+            };
+            let (line, col) = byte_position(source, name_match.start());
+            result.nodes.push(Node::new(
+                format!("{}::{}#{}", file_path, name, line),
+                kind,
+                name.clone(),
+                format!("{}::{}", file_path, name),
+                file_path.to_string(),
+                Language::Swift,
+                line,
+                line,
+                col,
+                col + name.len() as u32,
+            ));
+        }
+
+        for captures in SWIFT_ATTRIBUTE_RE.captures_iter(source) {
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let name = name_match.as_str().to_string();
+            if name == "propertyWrapper" {
+                continue;
+            }
+            let (line, col) = byte_position(source, name_match.start());
+            result.unresolved_refs.push(UnresolvedReference {
+                id: Some(0),
+                from_node_id: format!("{}::[file]", file_path),
+                reference_name: name,
+                reference_kind: "decorates".to_string(),
+                line,
+                col,
+                candidates: None,
+                file_path: file_path.to_string(),
+                language: Language::Swift.as_str().to_string(),
             });
         }
     }

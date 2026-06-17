@@ -702,6 +702,31 @@ fn java_annotation_project() -> TempDir {
     dir
 }
 
+fn swift_property_wrapper_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    let module_dir = dir.path().join("Sources").join("M");
+    fs::create_dir_all(&module_dir).expect("create module dir");
+    fs::write(
+        module_dir.join("Wrap.swift"),
+        "@propertyWrapper\npublic struct Argument<T> { public var wrappedValue: T }\n",
+    )
+    .expect("write wrapper");
+    fs::write(
+        module_dir.join("Cmd.swift"),
+        "public struct MyCommand {\n  @Argument var name: String\n  @Argument var count: Int\n}\n",
+    )
+    .expect("write command");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn mcp_text(result: &codegraph::mcp::protocol::CallToolResult) -> String {
     result
         .content
@@ -2049,6 +2074,32 @@ fn affected_follows_java_annotation_usage() {
         value["affectedTests"],
         serde_json::json!(["p/User.java"]),
         "expected annotation usage to make User.java affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_swift_property_wrapper_usage() {
+    let dir = swift_property_wrapper_project();
+    let output = run_codegraph(
+        &[
+            "affected",
+            "Sources/M/Wrap.swift",
+            "--json",
+            "--depth",
+            "5",
+            "--filter",
+            "Sources/M/Cmd.swift",
+        ],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["Sources/M/Cmd.swift"]),
+        "expected @Argument usage to make Cmd.swift affected:\n{value}"
     );
 }
 
