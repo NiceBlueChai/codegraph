@@ -4,6 +4,7 @@ use crate::db::QueryBuilder;
 use crate::types::*;
 use log::{debug, info};
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 
 /// Resolution context holds cached candidate nodes for efficient matching
@@ -141,29 +142,69 @@ impl<'a> Resolver<'a> {
     fn resolve_single(&self, uref: &UnresolvedReference, ctx: &ResolutionContext) -> Option<ResolvedReference> {
         let lang = Language::from_str(&uref.language).ok()?;
 
-        // Strategy 1: File path match (highest confidence)
+        // Strategy 1: Import path match (highest confidence for module imports)
+        if let Some(result) = self.match_import_path(uref, ctx, &lang) {
+            return Some(result);
+        }
+
+        // Strategy 2: File path match
         if let Some(result) = self.match_by_file_path(uref, ctx) {
             return Some(result);
         }
 
-        // Strategy 2: Qualified name match
+        // Strategy 3: Qualified name match
         if let Some(result) = self.match_by_qualified_name(uref, ctx, &lang) {
             return Some(result);
         }
 
-        // Strategy 3: Method call pattern (obj.method, Class::method)
+        // Strategy 4: Method call pattern (obj.method, Class::method)
         if let Some(result) = self.match_method_call(uref, ctx, &lang) {
             return Some(result);
         }
 
-        // Strategy 4: Exact name match (within language family)
+        // Strategy 5: Exact name match (within language family)
         if let Some(result) = self.match_by_exact_name(uref, ctx, &lang) {
             return Some(result);
         }
 
-        // Strategy 5: Fuzzy match (lowest confidence)
+        // Strategy 6: Fuzzy match (lowest confidence)
         if let Some(result) = self.match_fuzzy(uref, ctx, &lang) {
             return Some(result);
+        }
+
+        None
+    }
+
+    /// Strategy 1: Resolve relative module imports to indexed file nodes.
+    fn match_import_path(
+        &self,
+        uref: &UnresolvedReference,
+        ctx: &ResolutionContext,
+        lang: &Language,
+    ) -> Option<ResolvedReference> {
+        if !matches!(uref.reference_kind.as_str(), "import" | "imports" | "require") {
+            return None;
+        }
+        if !uref.reference_name.starts_with('.') {
+            return None;
+        }
+
+        let base_dir = Path::new(&uref.file_path)
+            .parent()
+            .and_then(|path| path.to_str())
+            .unwrap_or("");
+        for candidate in import_path_candidates(base_dir, &uref.reference_name, lang) {
+            if let Some(file_node) = ctx.nodes_by_file_path.get(&candidate) {
+                return Some(ResolvedReference {
+                    from_node_id: uref.from_node_id.clone(),
+                    target_node_id: file_node.id.clone(),
+                    edge_kind: self.infer_edge_kind(&uref.reference_kind),
+                    confidence: 0.95,
+                    strategy: ResolutionStrategy::ImportPath,
+                    line: uref.line,
+                    col: uref.col,
+                });
+            }
         }
 
         None
@@ -180,7 +221,7 @@ impl<'a> Resolver<'a> {
                 return Some(ResolvedReference {
                     from_node_id: uref.from_node_id.clone(),
                     target_node_id: file_node.id.clone(),
-                    edge_kind: EdgeKind::References,
+                    edge_kind: self.infer_edge_kind(&uref.reference_kind),
                     confidence: 0.95,
                     strategy: ResolutionStrategy::FilePath,
                     line: uref.line,
@@ -388,6 +429,48 @@ impl<'a> Resolver<'a> {
 
         Ok(())
     }
+}
+
+fn import_path_candidates(base_dir: &str, specifier: &str, lang: &Language) -> Vec<String> {
+    let base = if base_dir.is_empty() {
+        specifier.to_string()
+    } else {
+        format!("{}/{}", base_dir, specifier)
+    };
+    let base = normalize_relative_path(&base);
+    let mut out = vec![base.clone()];
+
+    if !Path::new(&base).extension().is_some() {
+        for ext in import_extensions(lang) {
+            out.push(format!("{}.{}", base, ext));
+            out.push(format!("{}/index.{}", base, ext));
+        }
+    }
+
+    out
+}
+
+fn import_extensions(lang: &Language) -> &'static [&'static str] {
+    match lang {
+        Language::TypeScript | Language::TSX => &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+        Language::JavaScript | Language::JSX => &["js", "jsx", "mjs", "cjs", "ts", "tsx"],
+        _ => &[],
+    }
+}
+
+fn normalize_relative_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    let normalized = path.replace('\\', "/");
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/")
 }
 
 #[cfg(test)]
