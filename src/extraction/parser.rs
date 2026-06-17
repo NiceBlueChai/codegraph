@@ -113,7 +113,7 @@ impl CodeParser {
             }
             Language::Python => Self::extract_py(source, file_path, &mut result),
             Language::Rust => Self::extract_rs(source, file_path, &mut result),
-            Language::C | Language::Cpp => {
+            Language::C | Language::Cpp | Language::Java => {
                 Self::extract_c_family(source, file_path, lang, &mut result)
             }
             Language::Go => Self::extract_go(source, file_path, &mut result),
