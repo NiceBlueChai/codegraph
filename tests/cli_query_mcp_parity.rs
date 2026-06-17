@@ -356,6 +356,19 @@ class Service
     dir
 }
 
+fn single_file_call_graph_project(file_name: &str, source: &str) -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::write(dir.path().join(file_name), source).expect("write source file");
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn many_matching_functions_then_class_project() -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     let init = run_codegraph(&["init", "--verbose"], dir.path());
@@ -826,6 +839,162 @@ fn csharp_indexing_builds_call_graph_for_relationship_commands() {
             .any(|node| node["name"] == "Serve"),
         "expected this.Clean() to resolve to Clean:\n{method_callers}"
     );
+}
+
+fn assert_basic_call_graph(dir: &TempDir) {
+    let callers_output = run_codegraph(&["callers", "Helper", "--json"], dir.path());
+    assert!(callers_output.status.success(), "stderr:\n{}", stderr(&callers_output));
+    let callers: serde_json::Value =
+        serde_json::from_str(&stdout(&callers_output)).expect("callers stdout is json");
+    assert!(
+        callers["callers"]
+            .as_array()
+            .expect("callers array")
+            .iter()
+            .any(|node| node["name"] == "Run"),
+        "expected Run to call Helper:\n{callers}"
+    );
+
+    let callees_output = run_codegraph(&["callees", "Run", "--json"], dir.path());
+    assert!(callees_output.status.success(), "stderr:\n{}", stderr(&callees_output));
+    let callees: serde_json::Value =
+        serde_json::from_str(&stdout(&callees_output)).expect("callees stdout is json");
+    assert!(
+        callees["callees"]
+            .as_array()
+            .expect("callees array")
+            .iter()
+            .any(|node| node["name"] == "Helper"),
+        "expected Run callees to include Helper:\n{callees}"
+    );
+
+    let impact_output = run_codegraph(&["impact", "Helper", "--json"], dir.path());
+    assert!(impact_output.status.success(), "stderr:\n{}", stderr(&impact_output));
+    let impact: serde_json::Value =
+        serde_json::from_str(&stdout(&impact_output)).expect("impact stdout is json");
+    assert!(
+        impact["affected"]
+            .as_array()
+            .expect("affected array")
+            .iter()
+            .any(|node| node["name"] == "Run"),
+        "expected Helper impact to include Run:\n{impact}"
+    );
+    assert!(
+        impact["edgeCount"].as_u64().unwrap_or(0) > 0,
+        "expected impact edgeCount to reflect the call edge:\n{impact}"
+    );
+
+    let method_callers_output = run_codegraph(&["callers", "Clean", "--json"], dir.path());
+    assert!(
+        method_callers_output.status.success(),
+        "method callers failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&method_callers_output),
+        stderr(&method_callers_output)
+    );
+    let method_callers: serde_json::Value =
+        serde_json::from_str(&stdout(&method_callers_output)).expect("method callers stdout is json");
+    assert!(
+        method_callers["callers"]
+            .as_array()
+            .expect("callers array")
+            .iter()
+            .any(|node| node["name"] == "Serve"),
+        "expected receiver Clean() call to resolve to Clean:\n{method_callers}"
+    );
+}
+
+#[test]
+fn c_like_languages_build_call_graph_for_relationship_commands() {
+    let fixtures = [
+        (
+            "service.php",
+            r#"<?php
+function Helper($value) {
+    return trim($value);
+}
+
+function Run($value) {
+    return Helper($value);
+}
+
+class Service {
+    function Clean($value) {
+        return $value;
+    }
+
+    function Serve($value) {
+        return $this->Clean($value);
+    }
+}
+"#,
+        ),
+        (
+            "Service.swift",
+            r#"
+func Helper(_ value: String) {
+}
+
+func Run(_ value: String) {
+    Helper(value)
+}
+
+class Service {
+    func Clean(_ value: String) {
+    }
+
+    func Serve(_ value: String) {
+        self.Clean(value)
+    }
+}
+"#,
+        ),
+        (
+            "Service.kt",
+            r#"
+fun Helper(value: String) {
+}
+
+fun Run(value: String) {
+    Helper(value)
+}
+
+class Service {
+    fun Clean(value: String) {
+    }
+
+    fun Serve(value: String) {
+        this.Clean(value)
+    }
+}
+"#,
+        ),
+        (
+            "service.dart",
+            r#"
+void Helper(String value) {
+}
+
+void Run(String value) {
+    Helper(value);
+}
+
+class Service {
+    void Clean(String value) {
+    }
+
+    void Serve(String value) {
+        this.Clean(value);
+    }
+}
+"#,
+        ),
+    ];
+
+    for (file_name, source) in fixtures {
+        let dir = single_file_call_graph_project(file_name, source);
+        assert_basic_call_graph(&dir);
+    }
 }
 
 #[test]
