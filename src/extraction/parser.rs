@@ -37,6 +37,29 @@ static GO_CALL_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid Go call regex")
 });
 
+static RUBY_METHOD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)^[ \t]*def\s+(?P<name>(?:self\.)?[A-Za-z_][A-Za-z0-9_!?=]*)"#)
+        .expect("valid Ruby method regex")
+});
+
+static RUBY_CALL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?P<callee>[A-Za-z_][A-Za-z0-9_!?=]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_!?=]*)*)\s*\("#)
+        .expect("valid Ruby call regex")
+});
+
+static LUA_FUNCTION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r#"(?m)^[ \t]*(?:local\s+)?function\s+"#,
+        r#"(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*)\s*\("#,
+    ))
+    .expect("valid Lua function regex")
+});
+
+static LUA_CALL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?P<callee>[A-Za-z_][A-Za-z0-9_]*(?:\s*[.:]\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\("#)
+        .expect("valid Lua call regex")
+});
+
 #[derive(Debug, Clone)]
 struct CFamilyFunctionSpan {
     id: String,
@@ -124,6 +147,22 @@ impl CodeParser {
                 Self::extract_c_family(source, file_path, lang, &mut result)
             }
             Language::Go => Self::extract_go(source, file_path, &mut result),
+            Language::Ruby => Self::extract_end_block_language(
+                source,
+                file_path,
+                Language::Ruby,
+                &RUBY_METHOD_RE,
+                &RUBY_CALL_RE,
+                &mut result,
+            ),
+            Language::Lua | Language::Luau => Self::extract_end_block_language(
+                source,
+                file_path,
+                lang,
+                &LUA_FUNCTION_RE,
+                &LUA_CALL_RE,
+                &mut result,
+            ),
             _ => {}
         }
         result
@@ -294,6 +333,94 @@ impl CodeParser {
                         line.len() as u32,
                     ));
                 }
+            }
+        }
+    }
+
+    fn extract_end_block_language(
+        source: &str,
+        file_path: &str,
+        lang: Language,
+        function_re: &Regex,
+        call_re: &Regex,
+        result: &mut ExtractionResult,
+    ) {
+        let masked_source = mask_c_family_noise(source);
+        let mut functions = Vec::new();
+
+        for captures in function_re.captures_iter(&masked_source) {
+            let Some(full_match) = captures.get(0) else {
+                continue;
+            };
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let raw_name = name_match.as_str().trim();
+            let name = normalize_end_block_symbol(raw_name);
+            if name.is_empty() || is_end_block_keyword(&name) {
+                continue;
+            }
+
+            let signature_end = find_line_end(&masked_source, full_match.end());
+            // ponytail: simple fallback only matches the next line-level `end`; use tree-sitter for nested blocks.
+            let Some((end_start, end_end)) = find_next_end_line(&masked_source, signature_end) else {
+                continue;
+            };
+
+            let (start_line, start_col) = byte_position(source, name_match.start());
+            let (end_line, end_col) = byte_position(source, end_end);
+            let id = format!("{}::{}#{}", file_path, name, start_line);
+            let mut node = Node::new(
+                id.clone(),
+                if raw_name.contains('.') || raw_name.contains(':') {
+                    NodeKind::Method
+                } else {
+                    NodeKind::Function
+                },
+                name.clone(),
+                format!("{}::{}", file_path, raw_name),
+                file_path.to_string(),
+                lang.clone(),
+                start_line,
+                end_line,
+                start_col,
+                end_col,
+            );
+            node.signature = Some(source[full_match.start()..signature_end].trim().to_string());
+            result.nodes.push(node);
+            functions.push(CFamilyFunctionSpan {
+                id,
+                body_start: signature_end,
+                body_end: end_start,
+            });
+        }
+
+        for function in functions {
+            if function.body_start >= function.body_end || function.body_end > masked_source.len() {
+                continue;
+            }
+            let body = &masked_source[function.body_start..function.body_end];
+            for captures in call_re.captures_iter(body) {
+                let Some(callee_match) = captures.name("callee") else {
+                    continue;
+                };
+                let callee = normalize_end_block_symbol(callee_match.as_str());
+                if callee.is_empty() || is_end_block_keyword(&callee) {
+                    continue;
+                }
+                let call_start = function.body_start + callee_match.start();
+                let (line, col) = byte_position(source, call_start);
+                result.unresolved_refs.push(UnresolvedReference {
+                    id: Some(0),
+                    from_node_id: function.id.clone(),
+                    reference_name: callee,
+                    reference_kind: "call".to_string(),
+                    line,
+                    col,
+                    candidates: None,
+                    file_path: file_path.to_string(),
+                    language: lang.as_str().to_string(),
+                });
             }
         }
     }
@@ -553,6 +680,26 @@ fn find_matching_brace(source: &str, open_brace: usize) -> Option<usize> {
     None
 }
 
+fn find_line_end(source: &str, byte_index: usize) -> usize {
+    let start = byte_index.min(source.len());
+    source[start..]
+        .find('\n')
+        .map(|offset| start + offset + 1)
+        .unwrap_or(source.len())
+}
+
+fn find_next_end_line(source: &str, byte_index: usize) -> Option<(usize, usize)> {
+    let mut line_start = byte_index.min(source.len());
+    for line in source[line_start..].split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        if line.trim() == "end" {
+            return Some((line_start, line_end));
+        }
+        line_start = line_end;
+    }
+    None
+}
+
 fn byte_position(source: &str, byte_index: usize) -> (u32, u32) {
     let capped = byte_index.min(source.len());
     let prefix = &source[..capped];
@@ -587,6 +734,27 @@ fn normalize_c_family_callee(raw_callee: &str) -> String {
         }
     }
     normalized
+}
+
+fn normalize_end_block_symbol(raw_name: &str) -> String {
+    raw_name
+        .split_whitespace()
+        .collect::<String>()
+        .trim_start_matches('&')
+        .replace("::", ".")
+        .rsplit(|ch| ch == '.' || ch == ':')
+        .next()
+        .unwrap_or(raw_name)
+        .trim()
+        .to_string()
+}
+
+fn is_end_block_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "unless" | "while" | "until" | "for" | "case" | "return" | "require" | "include"
+            | "do" | "then" | "and" | "or" | "not" | "function" | "local" | "end"
+    )
 }
 
 fn go_receiver_type(receiver: &str) -> Option<String> {

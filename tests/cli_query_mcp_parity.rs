@@ -998,6 +998,81 @@ class Service {
 }
 
 #[test]
+fn end_block_languages_build_call_graph_for_relationship_commands() {
+    let fixtures = [
+        (
+            "service.rb",
+            r#"
+def Helper(value)
+  value
+end
+
+def Run(value)
+  Helper(value)
+end
+
+def Clean(value)
+  value
+end
+
+def Serve(value)
+  self.Clean(value)
+end
+"#,
+        ),
+        (
+            "service.lua",
+            r#"
+function Helper(value)
+    return value
+end
+
+function Run(value)
+    return Helper(value)
+end
+
+local Service = {}
+
+function Service.Clean(value)
+    return value
+end
+
+function Service.Serve(value)
+    return Service.Clean(value)
+end
+"#,
+        ),
+        (
+            "service.luau",
+            r#"
+function Helper(value: string)
+    return value
+end
+
+function Run(value: string)
+    return Helper(value)
+end
+
+local Service = {}
+
+function Service.Clean(value: string)
+    return value
+end
+
+function Service.Serve(value: string)
+    return Service:Clean(value)
+end
+"#,
+        ),
+    ];
+
+    for (file_name, source) in fixtures {
+        let dir = single_file_call_graph_project(file_name, source);
+        assert_basic_call_graph(&dir);
+    }
+}
+
+#[test]
 fn status_json_is_machine_readable_from_subdirectory() {
     let dir = fixture_project();
     let src = dir.path().join("src");
