@@ -432,6 +432,10 @@ impl<'a> Resolver<'a> {
 }
 
 fn import_path_candidates(base_dir: &str, specifier: &str, lang: &Language) -> Vec<String> {
+    if *lang == Language::Python {
+        return python_import_path_candidates(base_dir, specifier);
+    }
+
     let base = if base_dir.is_empty() {
         specifier.to_string()
     } else {
@@ -454,8 +458,35 @@ fn import_extensions(lang: &Language) -> &'static [&'static str] {
     match lang {
         Language::TypeScript | Language::TSX => &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
         Language::JavaScript | Language::JSX => &["js", "jsx", "mjs", "cjs", "ts", "tsx"],
+        Language::Python => &["py"],
         _ => &[],
     }
+}
+
+fn python_import_path_candidates(base_dir: &str, specifier: &str) -> Vec<String> {
+    let leading_dots = specifier.chars().take_while(|ch| *ch == '.').count();
+    if leading_dots == 0 {
+        return Vec::new();
+    }
+
+    let mut base_parts = base_dir
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    for _ in 1..leading_dots {
+        base_parts.pop();
+    }
+
+    let remainder = specifier[leading_dots..].replace('.', "/");
+    let base = if remainder.is_empty() {
+        base_parts.join("/")
+    } else if base_parts.is_empty() {
+        remainder
+    } else {
+        format!("{}/{}", base_parts.join("/"), remainder)
+    };
+
+    vec![format!("{}.py", base), format!("{}/__init__.py", base)]
 }
 
 fn normalize_relative_path(path: &str) -> String {

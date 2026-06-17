@@ -558,6 +558,56 @@ fn ts_reexport_affected_project() -> TempDir {
     dir
 }
 
+fn python_import_affected_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("pkg")).expect("create pkg");
+    fs::write(dir.path().join("pkg").join("__init__.py"), "").expect("write init");
+    fs::write(
+        dir.path().join("pkg").join("foo.py"),
+        "def helper():\n    return 1\n",
+    )
+    .expect("write foo");
+    fs::write(
+        dir.path().join("pkg").join("foo.test.py"),
+        "from foo import helper\nregistry = [helper]\n",
+    )
+    .expect("write test");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
+fn python_relative_module_affected_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("pkg")).expect("create pkg");
+    fs::write(dir.path().join("pkg").join("__init__.py"), "").expect("write init");
+    fs::write(
+        dir.path().join("pkg").join("certs.py"),
+        "def where():\n    return '/ca.pem'\n",
+    )
+    .expect("write certs");
+    fs::write(
+        dir.path().join("pkg").join("utils.test.py"),
+        "from . import certs\nCA = certs.where()\n",
+    )
+    .expect("write test");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn mcp_text(result: &codegraph::mcp::protocol::CallToolResult) -> String {
     result
         .content
@@ -1809,6 +1859,36 @@ fn affected_follows_typescript_re_export_imports() {
         value["affectedTests"],
         serde_json::json!(["tests/foo.test.ts"]),
         "expected re-export chain to make foo.test.ts affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_python_imported_symbol_without_calling_it() {
+    let dir = python_import_affected_project();
+    let output = run_codegraph(&["affected", "pkg/foo.py", "--json", "--depth", "5"], dir.path());
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["pkg/foo.test.py"]),
+        "expected import-from symbol to make foo.test.py affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_python_relative_module_imports() {
+    let dir = python_relative_module_affected_project();
+    let output = run_codegraph(&["affected", "pkg/certs.py", "--json", "--depth", "5"], dir.path());
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["pkg/utils.test.py"]),
+        "expected relative module import to make utils.test.py affected:\n{value}"
     );
 }
 

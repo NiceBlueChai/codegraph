@@ -125,6 +125,11 @@ impl TreeSitterParser {
             "import_statement" => {
                 self.extract_import(node, source, file_path, lang, result);
             }
+            "import_from_statement" => {
+                if *lang == Language::Python {
+                    self.extract_python_import_from(node, source, file_path, result);
+                }
+            }
             "export_statement" => {
                 if node.child_by_field_name("source").is_some() {
                     self.extract_import(node, source, file_path, lang, result);
@@ -442,6 +447,56 @@ impl TreeSitterParser {
                 language: lang.as_str().to_string(),
             };
             result.unresolved_refs.push(uref);
+        }
+    }
+
+    fn extract_python_import_from(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let text = self.get_node_text(node, source);
+        let Some(import_index) = text.find(" import ") else {
+            return;
+        };
+        let module = text
+            .trim_start_matches("from ")
+            .get(..import_index.saturating_sub("from ".len()))
+            .unwrap_or("")
+            .trim();
+        let names = text[import_index + " import ".len()..].trim();
+        if names == "*" {
+            return;
+        }
+
+        for raw_name in names.split(',') {
+            let local_name = raw_name
+                .split(" as ")
+                .last()
+                .unwrap_or(raw_name)
+                .trim()
+                .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_');
+            if local_name.is_empty() {
+                continue;
+            }
+            let reference_name = if module == "." {
+                format!(".{}", local_name)
+            } else {
+                local_name.to_string()
+            };
+            result.unresolved_refs.push(UnresolvedReference {
+                id: Some(0),
+                from_node_id: format!("{}::[file]", file_path),
+                reference_name,
+                reference_kind: "imports".to_string(),
+                line: (node.start_position().row + 1) as u32,
+                col: node.start_position().column as u32,
+                candidates: None,
+                file_path: file_path.to_string(),
+                language: Language::Python.as_str().to_string(),
+            });
         }
     }
 
