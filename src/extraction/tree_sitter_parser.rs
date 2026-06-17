@@ -125,6 +125,11 @@ impl TreeSitterParser {
             "import_statement" => {
                 self.extract_import(node, source, file_path, lang, result);
             }
+            "export_statement" => {
+                if node.child_by_field_name("source").is_some() {
+                    self.extract_import(node, source, file_path, lang, result);
+                }
+            }
 
             // Method definitions inside classes
             "method_definition" => {

@@ -528,6 +528,36 @@ fn ts_import_affected_project() -> TempDir {
     dir
 }
 
+fn ts_reexport_affected_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("src")).expect("create src");
+    fs::create_dir_all(dir.path().join("tests")).expect("create tests");
+    fs::write(
+        dir.path().join("src").join("foo.ts"),
+        "export function helper(): void {}\n",
+    )
+    .expect("write foo");
+    fs::write(
+        dir.path().join("src").join("bar.ts"),
+        "export { helper } from './foo';\n",
+    )
+    .expect("write bar");
+    fs::write(
+        dir.path().join("tests").join("foo.test.ts"),
+        "import { helper } from '../src/bar';\nexport const registry = [helper];\n",
+    )
+    .expect("write test");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn mcp_text(result: &codegraph::mcp::protocol::CallToolResult) -> String {
     result
         .content
@@ -1764,6 +1794,21 @@ fn affected_follows_real_typescript_relative_imports() {
         value["affectedTests"],
         serde_json::json!(["tests/foo.test.ts"]),
         "expected relative import to make foo.test.ts affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_typescript_re_export_imports() {
+    let dir = ts_reexport_affected_project();
+    let output = run_codegraph(&["affected", "src/foo.ts", "--json", "--depth", "5"], dir.path());
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["tests/foo.test.ts"]),
+        "expected re-export chain to make foo.test.ts affected:\n{value}"
     );
 }
 
