@@ -644,7 +644,7 @@ fn cmd_query(path: &str, query: &str, limit: usize, kind: Option<&str>, json: bo
 fn cmd_serve(path: Option<&str>, mcp: bool, mcp_daemon: bool, no_watch: bool) -> anyhow::Result<()> {
     if mcp_daemon {
         let project = codegraph::project::resolve_project(path)?;
-        return codegraph::mcp::daemon::run_daemon(project);
+        return codegraph::mcp::daemon::run_daemon(project, !no_watch);
     }
 
     if mcp {
@@ -660,7 +660,7 @@ fn cmd_serve(path: Option<&str>, mcp: bool, mcp_daemon: bool, no_watch: bool) ->
         };
 
         if !daemon_opt_out_set() {
-            match codegraph::mcp::proxy::run(project.clone()) {
+            match codegraph::mcp::proxy::run(project.clone(), !no_watch) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     log::debug!("Falling back to direct MCP mode: {}", error);

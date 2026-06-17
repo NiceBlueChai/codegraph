@@ -41,14 +41,21 @@ fn fixture_project() -> TempDir {
 }
 
 fn spawn_daemon(project: &Path) -> Child {
-    Command::new(codegraph_bin())
+    spawn_daemon_with_env(project, &[])
+}
+
+fn spawn_daemon_with_env(project: &Path, envs: &[(&str, &str)]) -> Child {
+    let mut command = Command::new(codegraph_bin());
+    command
         .args(["serve", "--mcp-daemon", "--path"])
         .arg(project)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn daemon")
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.spawn().expect("spawn daemon")
 }
 
 fn read_pidfile(project: &Path) -> serde_json::Value {
@@ -271,6 +278,27 @@ fn stop_child(mut child: Child) {
     let _ = child.wait();
 }
 
+fn wait_for_query_output(project: &Path, symbol: &str, needle: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let output = Command::new(codegraph_bin())
+            .args(["query", symbol, "--json", "--path"])
+            .arg(project)
+            .output()
+            .expect("run query command");
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.contains(needle) {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for query output to contain {needle:?}; last stdout:\n{text}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn stop_pid(pid: &serde_json::Value) {
     if let Some(pid) = pid.as_u64() {
         if pid == u64::from(std::process::id()) {
@@ -487,6 +515,25 @@ fn local_handshake_answers_empty_resource_and_prompt_lists() {
         serde_json::json!([])
     );
     assert_eq!(responses[&4]["result"]["prompts"], serde_json::json!([]));
+}
+
+#[test]
+fn daemon_watcher_auto_syncs_modified_file() {
+    let project = fixture_project();
+    let daemon = spawn_daemon_with_env(project.path(), &[("CODEGRAPH_WATCH_DEBOUNCE_MS", "100")]);
+    let pid = read_pidfile(project.path())["pid"].clone();
+
+    fs::write(
+        project.path().join("app.ts"),
+        "export function runApp() { return 12345; }\n",
+    )
+    .expect("edit watched source");
+
+    let result = wait_for_query_output(project.path(), "runApp", "12345");
+
+    stop_pid(&pid);
+    stop_child(daemon);
+    result.expect("daemon watcher should sync edited source");
 }
 
 #[test]

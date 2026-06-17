@@ -15,7 +15,6 @@ struct PendingFileChange {
 
 /// Message type for the sync thread
 enum SyncMessage {
-    SyncFiles(Vec<String>),
     Stop,
 }
 
@@ -80,10 +79,6 @@ impl FileWatcher {
                     Ok(SyncMessage::Stop) => {
                         info!("Sync thread stopping");
                         break;
-                    }
-                    Ok(SyncMessage::SyncFiles(files)) => {
-                        sync_callback(&files);
-                        continue;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         info!("Sync channel disconnected");

@@ -19,11 +19,11 @@ use crate::project::ProjectContext;
 use serde_json::{json, Value};
 
 /// Connects stdio to the project daemon, spawning it if needed.
-pub fn run(project: ProjectContext) -> anyhow::Result<()> {
-    local_handshake_proxy(project)
+pub fn run(project: ProjectContext, watch_enabled: bool) -> anyhow::Result<()> {
+    local_handshake_proxy(project, watch_enabled)
 }
 
-fn connect_or_spawn(project: &ProjectContext) -> anyhow::Result<TcpStream> {
+fn connect_or_spawn(project: &ProjectContext, watch_enabled: bool) -> anyhow::Result<TcpStream> {
     if let Ok(info) = read_daemon_lock(daemon_pid_path(&project.root)) {
         if info.version != env!("CARGO_PKG_VERSION") && pid_is_alive(info.pid) {
             anyhow::bail!("daemon version mismatch");
@@ -47,8 +47,8 @@ fn connect_or_spawn(project: &ProjectContext) -> anyhow::Result<TcpStream> {
         return wait_for_daemon(project, Duration::from_secs(5));
     }
 
-    let result =
-        spawn_daemon(project).and_then(|_| wait_for_daemon(project, Duration::from_secs(5)));
+    let result = spawn_daemon(project, watch_enabled)
+        .and_then(|_| wait_for_daemon(project, Duration::from_secs(5)));
     let _ = fs::remove_file(lock_path);
     result
 }
@@ -78,14 +78,19 @@ fn wait_for_daemon(project: &ProjectContext, timeout: Duration) -> anyhow::Resul
     }
 }
 
-fn spawn_daemon(project: &ProjectContext) -> anyhow::Result<()> {
-    Command::new(std::env::current_exe()?)
-        .args(["serve", "--mcp-daemon", "--path"])
+fn spawn_daemon(project: &ProjectContext, watch_enabled: bool) -> anyhow::Result<()> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command.args(["serve", "--mcp-daemon"]);
+    if !watch_enabled {
+        command.arg("--no-watch");
+    }
+    command
+        .arg("--path")
         .arg(&project.root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    command.spawn()?;
     Ok(())
 }
 
@@ -100,7 +105,7 @@ fn connect_with_hello(addr: &str) -> anyhow::Result<TcpStream> {
     Ok(stream)
 }
 
-fn local_handshake_proxy(project: ProjectContext) -> anyhow::Result<()> {
+fn local_handshake_proxy(project: ProjectContext, watch_enabled: bool) -> anyhow::Result<()> {
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -119,7 +124,7 @@ fn local_handshake_proxy(project: ProjectContext) -> anyhow::Result<()> {
     let (connect_tx, connect_rx) = mpsc::channel::<anyhow::Result<TcpStream>>();
     let project_for_connect = project.clone();
     thread::spawn(move || {
-        let _ = connect_tx.send(connect_or_spawn(&project_for_connect));
+        let _ = connect_tx.send(connect_or_spawn(&project_for_connect, watch_enabled));
     });
 
     let mut daemon_writer: Option<TcpStream> = None;
