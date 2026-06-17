@@ -57,6 +57,12 @@ impl FileWatcher {
     where
         F: Fn(&[String]) + Send + 'static,
     {
+        if let Some(reason) = watch_disabled_reason(&self.project_root) {
+            info!("File watcher disabled: {}", reason);
+            self.is_running = false;
+            return Ok(());
+        }
+
         info!("Starting file watcher for {}", self.project_root);
 
         let pending_files = Arc::clone(&self.pending_files);
@@ -291,9 +297,85 @@ fn current_time_ms() -> u128 {
         .as_millis()
 }
 
+/// Returns a human-readable reason when live watching should be disabled.
+pub fn watch_disabled_reason(project_root: &str) -> Option<String> {
+    let no_watch = truthy_env("CODEGRAPH_NO_WATCH");
+    let force_watch = truthy_env("CODEGRAPH_FORCE_WATCH");
+    watch_disabled_reason_with(project_root, no_watch, force_watch, detect_wsl())
+}
+
+fn watch_disabled_reason_with(
+    project_root: &str,
+    no_watch: bool,
+    force_watch: bool,
+    is_wsl: bool,
+) -> Option<String> {
+    if no_watch {
+        return Some("CODEGRAPH_NO_WATCH is set".to_string());
+    }
+    if force_watch {
+        return None;
+    }
+    if is_wsl && is_windows_drive_mount(project_root) {
+        return Some(
+            "project is on a WSL /mnt drive where recursive watching is slow".to_string(),
+        );
+    }
+    None
+}
+
+fn truthy_env(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+fn is_windows_drive_mount(project_root: &str) -> bool {
+    let normalized = project_root.replace('\\', "/").to_ascii_lowercase();
+    let rest = match normalized.strip_prefix("/mnt/") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_lowercase())
+        && matches!(chars.next(), Some('/') | None)
+}
+
+fn detect_wsl() -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::env::var_os("WSL_INTEROP").is_some()
+        {
+            return true;
+        }
+        std::fs::read_to_string("/proc/version")
+            .map(|version| {
+                let version = version.to_ascii_lowercase();
+                version.contains("microsoft") || version.contains("wsl")
+            })
+            .unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn test_is_source_file() {
@@ -322,5 +404,46 @@ mod tests {
 
         let rel = get_relative_path(Path::new(full_path), project_root);
         assert_eq!(rel, Some("src/main.ts".to_string()));
+    }
+
+    #[test]
+    fn watch_policy_no_watch_wins() {
+        let reason = watch_disabled_reason_with("/home/me/project", true, true, false);
+
+        assert!(reason.unwrap().contains("CODEGRAPH_NO_WATCH"));
+    }
+
+    #[test]
+    fn watch_policy_disables_wsl_windows_drive_mounts() {
+        let reason = watch_disabled_reason_with("/mnt/d/code/project", false, false, true);
+
+        assert!(reason.unwrap().contains("/mnt"));
+        assert!(watch_disabled_reason_with("/mnt/wsl/project", false, false, true).is_none());
+        assert!(watch_disabled_reason_with("/mnt/d/code/project", false, false, false).is_none());
+    }
+
+    #[test]
+    fn watch_policy_force_watch_overrides_wsl_mount() {
+        let reason = watch_disabled_reason_with("/mnt/d/code/project", false, true, true);
+
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn watch_policy_env_no_watch_keeps_watcher_inactive() {
+        let _guard = env_lock();
+        let previous = std::env::var_os("CODEGRAPH_NO_WATCH");
+        std::env::set_var("CODEGRAPH_NO_WATCH", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let mut watcher = FileWatcher::new(dir.path().to_str().unwrap());
+
+        watcher.start(|_| {}).unwrap();
+
+        assert!(!watcher.is_running());
+        if let Some(previous) = previous {
+            std::env::set_var("CODEGRAPH_NO_WATCH", previous);
+        } else {
+            std::env::remove_var("CODEGRAPH_NO_WATCH");
+        }
     }
 }
