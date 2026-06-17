@@ -60,6 +60,15 @@ static LUA_CALL_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid Lua call regex")
 });
 
+static JAVA_ANNOTATION_DECL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)^[ \t]*(?:public\s+)?@interface\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"#)
+        .expect("valid Java annotation declaration regex")
+});
+
+static JAVA_ANNOTATION_USE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"@(?P<name>[A-Z][A-Za-z0-9_]*)"#).expect("valid Java annotation usage regex")
+});
+
 #[derive(Debug, Clone)]
 struct CFamilyFunctionSpan {
     id: String,
@@ -523,6 +532,10 @@ impl CodeParser {
         let masked_source = mask_c_family_noise(source);
         let mut functions = Vec::new();
 
+        if lang == Language::Java {
+            Self::extract_java_annotations(source, file_path, result);
+        }
+
         for captures in C_FAMILY_FUNCTION_RE.captures_iter(&masked_source) {
             let Some(full_match) = captures.get(0) else {
                 continue;
@@ -602,6 +615,47 @@ impl CodeParser {
                     language: lang.as_str().to_string(),
                 });
             }
+        }
+    }
+
+    fn extract_java_annotations(source: &str, file_path: &str, result: &mut ExtractionResult) {
+        for captures in JAVA_ANNOTATION_DECL_RE.captures_iter(source) {
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let name = name_match.as_str().to_string();
+            let (line, col) = byte_position(source, name_match.start());
+            result.nodes.push(Node::new(
+                format!("{}::{}#{}", file_path, name, line),
+                NodeKind::Interface,
+                name.clone(),
+                format!("{}::{}", file_path, name),
+                file_path.to_string(),
+                Language::Java,
+                line,
+                line,
+                col,
+                col + name.len() as u32,
+            ));
+        }
+
+        for captures in JAVA_ANNOTATION_USE_RE.captures_iter(source) {
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let name = name_match.as_str().to_string();
+            let (line, col) = byte_position(source, name_match.start());
+            result.unresolved_refs.push(UnresolvedReference {
+                id: Some(0),
+                from_node_id: format!("{}::[file]", file_path),
+                reference_name: name,
+                reference_kind: "decorates".to_string(),
+                line,
+                col,
+                candidates: None,
+                file_path: file_path.to_string(),
+                language: Language::Java.as_str().to_string(),
+            });
         }
     }
 }

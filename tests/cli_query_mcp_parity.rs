@@ -671,6 +671,37 @@ fn rust_use_collision_project() -> TempDir {
     dir
 }
 
+fn java_annotation_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("p")).expect("create p");
+    fs::write(
+        dir.path().join("p").join("MyAnno.java"),
+        "package p;\npublic @interface MyAnno { String value() default \"\"; }\n",
+    )
+    .expect("write annotation");
+    fs::write(
+        dir.path().join("p").join("User.java"),
+        concat!(
+            "package p;\n",
+            "@MyAnno(\"c\")\n",
+            "public class User {\n",
+            "  @MyAnno(\"f\") int field;\n",
+            "  @MyAnno(\"m\") void go() {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write user");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn mcp_text(result: &codegraph::mcp::protocol::CallToolResult) -> String {
     result
         .content
@@ -2000,6 +2031,24 @@ fn affected_resolves_rust_pub_use_to_qualified_module_path() {
         slow_value["affectedTests"],
         serde_json::json!([]),
         "hub.rs must not depend on slow.rs:\n{slow_value}"
+    );
+}
+
+#[test]
+fn affected_follows_java_annotation_usage() {
+    let dir = java_annotation_project();
+    let output = run_codegraph(
+        &["affected", "p/MyAnno.java", "--json", "--depth", "5", "--filter", "p/User.java"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["p/User.java"]),
+        "expected annotation usage to make User.java affected:\n{value}"
     );
 }
 

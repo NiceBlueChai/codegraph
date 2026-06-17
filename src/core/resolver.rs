@@ -427,6 +427,7 @@ impl<'a> Resolver<'a> {
             "implements" | "interface" => EdgeKind::Implements,
             "type" | "type_ref" => EdgeKind::TypeOf,
             "instantiation" | "new" => EdgeKind::Instantiates,
+            "decorates" | "decorator" | "annotation" => EdgeKind::Decorates,
             _ => EdgeKind::References,
         }
     }
