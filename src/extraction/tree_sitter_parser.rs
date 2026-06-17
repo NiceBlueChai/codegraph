@@ -169,6 +169,11 @@ impl TreeSitterParser {
                     self.extract_rust_impl(node, source, file_path, result);
                 }
             }
+            "use_declaration" => {
+                if *lang == Language::Rust {
+                    self.extract_rust_use(node, source, file_path, result);
+                }
+            }
 
             // Call expressions (for call edges)
             "call_expression" => {
@@ -704,6 +709,43 @@ impl TreeSitterParser {
                 }
             }
         }
+    }
+
+    fn extract_rust_use(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let text = self
+            .get_node_text(node, source)
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        let Some(path) = text
+            .strip_prefix("pub use ")
+            .or_else(|| text.strip_prefix("use "))
+            .map(str::trim)
+        else {
+            return;
+        };
+        if path.ends_with("::*") || path.is_empty() {
+            return;
+        }
+
+        result.unresolved_refs.push(UnresolvedReference {
+            id: Some(0),
+            from_node_id: format!("{}::[file]", file_path),
+            reference_name: path.to_string(),
+            reference_kind: "imports".to_string(),
+            line: (node.start_position().row + 1) as u32,
+            col: node.start_position().column as u32,
+            candidates: None,
+            file_path: file_path.to_string(),
+            language: Language::Rust.as_str().to_string(),
+        });
     }
 
     fn extract_call(

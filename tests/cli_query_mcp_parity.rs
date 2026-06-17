@@ -608,6 +608,69 @@ fn python_relative_module_affected_project() -> TempDir {
     dir
 }
 
+fn rust_use_reexport_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("src").join("api")).expect("create api");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write cargo");
+    fs::write(dir.path().join("src").join("lib.rs"), "pub mod api;\n").expect("write lib");
+    fs::write(
+        dir.path().join("src").join("api").join("mod.rs"),
+        "mod widget;\npub use self::widget::Widget;\n",
+    )
+    .expect("write mod");
+    fs::write(
+        dir.path().join("src").join("api").join("widget.rs"),
+        "pub struct Widget { pub n: i32 }\n",
+    )
+    .expect("write widget");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
+fn rust_use_collision_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("src")).expect("create src");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write cargo");
+    fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub mod fast;\npub mod slow;\npub mod hub;\n",
+    )
+    .expect("write lib");
+    fs::write(dir.path().join("src").join("fast.rs"), "pub fn read() -> i32 { 1 }\n")
+        .expect("write fast");
+    fs::write(dir.path().join("src").join("slow.rs"), "pub fn read() -> i32 { 2 }\n")
+        .expect("write slow");
+    fs::write(
+        dir.path().join("src").join("hub.rs"),
+        "pub use crate::fast::read;\n",
+    )
+    .expect("write hub");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn mcp_text(result: &codegraph::mcp::protocol::CallToolResult) -> String {
     result
         .content
@@ -1889,6 +1952,54 @@ fn affected_follows_python_relative_module_imports() {
         value["affectedTests"],
         serde_json::json!(["pkg/utils.test.py"]),
         "expected relative module import to make utils.test.py affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_rust_pub_use_reexport_hub() {
+    let dir = rust_use_reexport_project();
+    let output = run_codegraph(
+        &["affected", "src/api/widget.rs", "--json", "--depth", "5", "--filter", "src/api/mod.rs"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["src/api/mod.rs"]),
+        "expected pub use hub to depend on widget.rs:\n{value}"
+    );
+}
+
+#[test]
+fn affected_resolves_rust_pub_use_to_qualified_module_path() {
+    let dir = rust_use_collision_project();
+    let fast = run_codegraph(
+        &["affected", "src/fast.rs", "--json", "--depth", "5", "--filter", "src/hub.rs"],
+        dir.path(),
+    );
+    assert!(fast.status.success(), "stderr:\n{}", stderr(&fast));
+    let fast_value: serde_json::Value =
+        serde_json::from_str(&stdout(&fast)).expect("affected stdout is json");
+    assert_eq!(
+        fast_value["affectedTests"],
+        serde_json::json!(["src/hub.rs"]),
+        "expected hub.rs to depend on fast.rs:\n{fast_value}"
+    );
+
+    let slow = run_codegraph(
+        &["affected", "src/slow.rs", "--json", "--depth", "5", "--filter", "src/hub.rs"],
+        dir.path(),
+    );
+    assert!(slow.status.success(), "stderr:\n{}", stderr(&slow));
+    let slow_value: serde_json::Value =
+        serde_json::from_str(&stdout(&slow)).expect("affected stdout is json");
+    assert_eq!(
+        slow_value["affectedTests"],
+        serde_json::json!([]),
+        "hub.rs must not depend on slow.rs:\n{slow_value}"
     );
 }
 

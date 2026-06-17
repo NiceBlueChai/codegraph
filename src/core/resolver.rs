@@ -185,6 +185,9 @@ impl<'a> Resolver<'a> {
         if !matches!(uref.reference_kind.as_str(), "import" | "imports" | "require") {
             return None;
         }
+        if *lang == Language::Rust {
+            return self.match_rust_use_path(uref, ctx);
+        }
         if !uref.reference_name.starts_with('.') {
             return None;
         }
@@ -194,6 +197,32 @@ impl<'a> Resolver<'a> {
             .and_then(|path| path.to_str())
             .unwrap_or("");
         for candidate in import_path_candidates(base_dir, &uref.reference_name, lang) {
+            if let Some(file_node) = ctx.nodes_by_file_path.get(&candidate) {
+                return Some(ResolvedReference {
+                    from_node_id: uref.from_node_id.clone(),
+                    target_node_id: file_node.id.clone(),
+                    edge_kind: self.infer_edge_kind(&uref.reference_kind),
+                    confidence: 0.95,
+                    strategy: ResolutionStrategy::ImportPath,
+                    line: uref.line,
+                    col: uref.col,
+                });
+            }
+        }
+
+        None
+    }
+
+    fn match_rust_use_path(
+        &self,
+        uref: &UnresolvedReference,
+        ctx: &ResolutionContext,
+    ) -> Option<ResolvedReference> {
+        let module_path = rust_use_module_file_path(&uref.file_path, &uref.reference_name)?;
+        for candidate in [
+            format!("{}.rs", module_path),
+            format!("{}/mod.rs", module_path),
+        ] {
             if let Some(file_node) = ctx.nodes_by_file_path.get(&candidate) {
                 return Some(ResolvedReference {
                     from_node_id: uref.from_node_id.clone(),
@@ -487,6 +516,44 @@ fn python_import_path_candidates(base_dir: &str, specifier: &str) -> Vec<String>
     };
 
     vec![format!("{}.py", base), format!("{}/__init__.py", base)]
+}
+
+fn rust_use_module_file_path(file_path: &str, use_path: &str) -> Option<String> {
+    let segments = use_path
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let module_segments = &segments[..segments.len() - 1];
+    match module_segments.first().copied()? {
+        "crate" => Some(format!("src/{}", module_segments[1..].join("/"))),
+        "self" => {
+            let current_dir = rust_current_module_dir(file_path);
+            let rel = module_segments[1..].join("/");
+            Some(if rel.is_empty() {
+                current_dir
+            } else if current_dir.is_empty() {
+                rel
+            } else {
+                format!("{}/{}", current_dir, rel)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn rust_current_module_dir(file_path: &str) -> String {
+    let path = file_path.replace('\\', "/");
+    if let Some(dir) = path.strip_suffix("/mod.rs") {
+        return dir.to_string();
+    }
+    path.rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default()
 }
 
 fn normalize_relative_path(path: &str) -> String {
