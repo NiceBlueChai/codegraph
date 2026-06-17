@@ -356,6 +356,36 @@ class Service
     dir
 }
 
+fn csharp_record_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::write(
+        dir.path().join("types.cs"),
+        "namespace P;\npublic record Box(int N);\n",
+    )
+    .expect("write types");
+    fs::write(
+        dir.path().join("use.cs"),
+        concat!(
+            "using System.Collections.Generic;\n",
+            "namespace P;\n",
+            "public class User {\n",
+            "    public IEnumerable<Box> Boxes { get; }\n",
+            "    public Box Make() => new Box(1);\n",
+            "}\n",
+        ),
+    )
+    .expect("write use");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn single_file_call_graph_project(file_name: &str, source: &str) -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     fs::write(dir.path().join(file_name), source).expect("write source file");
@@ -2100,6 +2130,24 @@ fn affected_follows_swift_property_wrapper_usage() {
         value["affectedTests"],
         serde_json::json!(["Sources/M/Cmd.swift"]),
         "expected @Argument usage to make Cmd.swift affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_csharp_record_references() {
+    let dir = csharp_record_project();
+    let output = run_codegraph(
+        &["affected", "types.cs", "--json", "--depth", "5", "--filter", "use.cs"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["use.cs"]),
+        "expected record references to make use.cs affected:\n{value}"
     );
 }
 

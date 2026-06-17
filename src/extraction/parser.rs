@@ -78,6 +78,34 @@ static SWIFT_ATTRIBUTE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"@(?P<name>[A-Z][A-Za-z0-9_]*)"#).expect("valid Swift attribute regex")
 });
 
+static CSHARP_RECORD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r#"(?m)^[ \t]*(?:public\s+)?record\s+"#,
+        r#"(?P<shape>class\s+|struct\s+)?"#,
+        r#"(?P<name>[A-Z][A-Za-z0-9_]*)"#,
+    ))
+    .expect("valid C# record regex")
+});
+
+static CSHARP_NEW_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bnew\s+(?P<name>[A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*\("#)
+        .expect("valid C# new regex")
+});
+
+static CSHARP_GENERIC_ARG_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"<\s*(?P<name>[A-Z][A-Za-z0-9_]*)\s*(?:[,>])"#)
+        .expect("valid C# generic argument regex")
+});
+
+static CSHARP_DECLARED_TYPE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r#"\b(?:public|private|protected|internal)\s+"#,
+        r#"(?:static\s+)?"#,
+        r#"(?P<name>[A-Z][A-Za-z0-9_]*)\s+[A-Za-z_][A-Za-z0-9_]*\b"#,
+    ))
+    .expect("valid C# declared type regex")
+});
+
 #[derive(Debug, Clone)]
 struct CFamilyFunctionSpan {
     id: String,
@@ -547,6 +575,9 @@ impl CodeParser {
         if lang == Language::Swift {
             Self::extract_swift_types_and_attributes(source, file_path, result);
         }
+        if lang == Language::CSharp {
+            Self::extract_csharp_records_and_refs(source, file_path, result);
+        }
 
         for captures in C_FAMILY_FUNCTION_RE.captures_iter(&masked_source) {
             let Some(full_match) = captures.get(0) else {
@@ -668,6 +699,54 @@ impl CodeParser {
                 file_path: file_path.to_string(),
                 language: Language::Java.as_str().to_string(),
             });
+        }
+    }
+
+    fn extract_csharp_records_and_refs(
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        for captures in CSHARP_RECORD_RE.captures_iter(source) {
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let name = name_match.as_str().to_string();
+            let shape = captures.name("shape").map(|m| m.as_str().trim());
+            let kind = if shape == Some("struct") {
+                NodeKind::Struct
+            } else {
+                NodeKind::Class
+            };
+            let (line, col) = byte_position(source, name_match.start());
+            result.nodes.push(Node::new(
+                format!("{}::{}#{}", file_path, name, line),
+                kind,
+                name.clone(),
+                format!("{}::{}", file_path, name),
+                file_path.to_string(),
+                Language::CSharp,
+                line,
+                line,
+                col,
+                col + name.len() as u32,
+            ));
+        }
+
+        for captures in CSHARP_NEW_RE.captures_iter(source) {
+            if let Some(name_match) = captures.name("name") {
+                push_csharp_type_ref(source, file_path, result, name_match, "new");
+            }
+        }
+        for captures in CSHARP_GENERIC_ARG_RE.captures_iter(source) {
+            if let Some(name_match) = captures.name("name") {
+                push_csharp_type_ref(source, file_path, result, name_match, "type");
+            }
+        }
+        for captures in CSHARP_DECLARED_TYPE_RE.captures_iter(source) {
+            if let Some(name_match) = captures.name("name") {
+                push_csharp_type_ref(source, file_path, result, name_match, "type");
+            }
         }
     }
 
@@ -856,6 +935,39 @@ fn normalize_c_family_callee(raw_callee: &str) -> String {
         }
     }
     normalized
+}
+
+fn push_csharp_type_ref(
+    source: &str,
+    file_path: &str,
+    result: &mut ExtractionResult,
+    name_match: regex::Match<'_>,
+    reference_kind: &str,
+) {
+    let name = name_match.as_str().to_string();
+    if is_csharp_builtin_type(&name) {
+        return;
+    }
+    let (line, col) = byte_position(source, name_match.start());
+    result.unresolved_refs.push(UnresolvedReference {
+        id: Some(0),
+        from_node_id: format!("{}::[file]", file_path),
+        reference_name: name,
+        reference_kind: reference_kind.to_string(),
+        line,
+        col,
+        candidates: None,
+        file_path: file_path.to_string(),
+        language: Language::CSharp.as_str().to_string(),
+    });
+}
+
+fn is_csharp_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "String" | "Object" | "Int16" | "Int32" | "Int64" | "UInt16" | "UInt32" | "UInt64"
+            | "Boolean" | "Byte" | "Char" | "Decimal" | "Double" | "Single" | "Void"
+    )
 }
 
 fn normalize_end_block_symbol(raw_name: &str) -> String {
