@@ -22,6 +22,21 @@ static C_FAMILY_CALL_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid C-family call regex")
 });
 
+static GO_FUNCTION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r#"(?m)^[ \t]*func\s+"#,
+        r#"(?P<receiver>\([^)]*\)\s*)?"#,
+        r#"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*"#,
+        r#"(?:\[[^\]]*\]\s*)?\([^;{}]*\)\s*[^{;]*\{"#,
+    ))
+    .expect("valid Go function regex")
+});
+
+static GO_CALL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?P<callee>[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\("#)
+        .expect("valid Go call regex")
+});
+
 #[derive(Debug, Clone)]
 struct CFamilyFunctionSpan {
     id: String,
@@ -101,6 +116,7 @@ impl CodeParser {
             Language::C | Language::Cpp => {
                 Self::extract_c_family(source, file_path, lang, &mut result)
             }
+            Language::Go => Self::extract_go(source, file_path, &mut result),
             _ => {}
         }
         result
@@ -271,6 +287,95 @@ impl CodeParser {
                         line.len() as u32,
                     ));
                 }
+            }
+        }
+    }
+
+    fn extract_go(source: &str, file_path: &str, result: &mut ExtractionResult) {
+        let masked_source = mask_c_family_noise(source);
+        let mut functions = Vec::new();
+
+        for captures in GO_FUNCTION_RE.captures_iter(&masked_source) {
+            let Some(full_match) = captures.get(0) else {
+                continue;
+            };
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let name = name_match.as_str().trim().to_string();
+            if name.is_empty() || is_go_keyword(&name) {
+                continue;
+            }
+
+            let Some(open_brace) = masked_source[full_match.start()..full_match.end()]
+                .rfind('{')
+                .map(|offset| full_match.start() + offset)
+            else {
+                continue;
+            };
+            let Some(close_brace) = find_matching_brace(&masked_source, open_brace) else {
+                continue;
+            };
+
+            let receiver = captures.name("receiver").and_then(|m| go_receiver_type(m.as_str()));
+            let (start_line, start_col) = byte_position(source, name_match.start());
+            let (end_line, end_col) = byte_position(source, close_brace);
+            let id = format!("{}::{}#{}", file_path, name, start_line);
+            let qualified_name = receiver
+                .as_ref()
+                .map(|receiver| format!("{}::{}.{}", file_path, receiver, name))
+                .unwrap_or_else(|| format!("{}::{}", file_path, name));
+            let mut node = Node::new(
+                id.clone(),
+                if receiver.is_some() {
+                    NodeKind::Method
+                } else {
+                    NodeKind::Function
+                },
+                name.clone(),
+                qualified_name,
+                file_path.to_string(),
+                Language::Go,
+                start_line,
+                end_line,
+                start_col,
+                end_col,
+            );
+            node.signature = Some(source[full_match.start()..open_brace].trim().to_string());
+            result.nodes.push(node);
+            functions.push(CFamilyFunctionSpan {
+                id,
+                body_start: open_brace + 1,
+                body_end: close_brace,
+            });
+        }
+
+        for function in functions {
+            if function.body_start >= function.body_end || function.body_end > masked_source.len() {
+                continue;
+            }
+            let body = &masked_source[function.body_start..function.body_end];
+            for captures in GO_CALL_RE.captures_iter(body) {
+                let Some(callee_match) = captures.name("callee") else {
+                    continue;
+                };
+                let callee = normalize_go_callee(callee_match.as_str());
+                if callee.is_empty() || is_go_keyword(&callee) {
+                    continue;
+                }
+                let call_start = function.body_start + callee_match.start();
+                let (line, col) = byte_position(source, call_start);
+                result.unresolved_refs.push(UnresolvedReference {
+                    id: Some(0),
+                    from_node_id: function.id.clone(),
+                    reference_name: callee,
+                    reference_kind: "call".to_string(),
+                    line,
+                    col,
+                    candidates: None,
+                    file_path: file_path.to_string(),
+                    language: Language::Go.as_str().to_string(),
+                });
             }
         }
     }
@@ -475,6 +580,40 @@ fn normalize_c_family_callee(raw_callee: &str) -> String {
         }
     }
     normalized
+}
+
+fn go_receiver_type(receiver: &str) -> Option<String> {
+    let receiver = receiver.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    let raw_type = receiver.split_whitespace().last()?.trim();
+    let name = raw_type
+        .trim_start_matches('*')
+        .trim_start_matches("[]")
+        .rsplit('.')
+        .next()
+        .unwrap_or(raw_type)
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn normalize_go_callee(raw_callee: &str) -> String {
+    raw_callee
+        .split_whitespace()
+        .collect::<String>()
+        .rsplit('.')
+        .next()
+        .unwrap_or(raw_callee)
+        .trim()
+        .to_string()
+}
+
+fn is_go_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "break" | "case" | "chan" | "const" | "continue" | "default" | "defer" | "else"
+            | "fallthrough" | "for" | "func" | "go" | "goto" | "if" | "import"
+            | "interface" | "map" | "package" | "range" | "return" | "select" | "struct"
+            | "switch" | "type" | "var"
+    )
 }
 
 fn is_c_family_keyword(name: &str) -> bool {
