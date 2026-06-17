@@ -8,6 +8,7 @@ use std::path::Path;
 
 use globset::Glob;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::context_formatter;
 use crate::core::query::GraphTraverser;
@@ -64,6 +65,16 @@ pub struct ImpactSummary {
     pub affected: Vec<Node>,
     /// Number of deduplicated graph edges in the impact radius.
     pub edge_count: usize,
+}
+
+/// Indexed file whose on-disk content no longer matches the stored index hash.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingSyncFile {
+    /// Indexed project-relative path.
+    pub path: String,
+    /// Approximate age since the file was last indexed.
+    #[serde(rename = "ageMs")]
+    pub age_ms: u64,
 }
 
 /// Shared query facade used by CLI commands and MCP handlers.
@@ -206,6 +217,27 @@ impl<'a> QueryService<'a> {
             count: entries.len(),
             files: entries,
         })
+    }
+
+    /// Finds indexed files whose current disk content differs from the stored hash.
+    pub fn pending_sync_files(&self) -> anyhow::Result<Vec<PendingSyncFile>> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut pending = Vec::new();
+        for file in self.queries.get_all_files()? {
+            let full_path = self.project.root.join(&file.path);
+            let stale = match crate::util::read_file_content(&full_path) {
+                Ok(content) => hash_content(&content) != file.content_hash,
+                Err(_) => true,
+            };
+            if stale {
+                pending.push(PendingSyncFile {
+                    path: file.path,
+                    age_ms: now.saturating_sub(file.indexed_at).max(0) as u64,
+                });
+            }
+        }
+        pending.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(pending)
     }
 
     /// Renders an indexed file view as Markdown with tab-separated line numbers.
@@ -546,6 +578,12 @@ fn source_window_len(node: &Node) -> usize {
     let start = node.start_line as usize;
     let end = node.end_line.max(node.start_line) as usize;
     end.saturating_sub(start) + 3
+}
+
+fn hash_content(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

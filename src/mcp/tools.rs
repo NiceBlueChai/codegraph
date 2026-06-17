@@ -2,7 +2,7 @@
 
 use crate::db::QueryBuilder;
 use crate::mcp::protocol::{CallToolResult, ContentBlock, ToolDefinition, ToolInputSchema};
-use crate::query_service::QueryService;
+use crate::query_service::{PendingSyncFile, QueryService};
 use serde_json::{json, Value};
 
 const TOOL_PREFIX: &str = "codegraph_";
@@ -374,7 +374,7 @@ pub fn execute_tool<'a>(
     let args = arguments.unwrap_or_else(|| json!({}));
     let service = QueryService::new(project.clone(), QueryBuilder::new(queries.get_conn()));
 
-    match tool_name {
+    let mut result = match tool_name {
         "codegraph_explore" => handle_explore(&service, &args),
         "codegraph_node" => handle_node(&service, &args),
         "codegraph_search" => handle_search(&service, &args),
@@ -384,7 +384,13 @@ pub fn execute_tool<'a>(
         "codegraph_files" => handle_files(&service, &args),
         "codegraph_status" => handle_status(&service),
         _ => text_error(format!("Unknown tool: {}", tool_name)),
+    }?;
+
+    if tool_name != "codegraph_status" && result.is_error != Some(true) {
+        add_staleness_notice(&service, &mut result)?;
     }
+
+    Ok(result)
 }
 
 fn handle_explore(
@@ -537,6 +543,7 @@ fn handle_files(
 
 fn handle_status(service: &QueryService<'_>) -> Result<CallToolResult, Box<dyn std::error::Error>> {
     let stats = service.queries.get_stats()?;
+    let pending_sync = service.pending_sync_files()?;
     let output = json!({
         "initialized": true,
         "root": service.project.root.display().to_string(),
@@ -544,9 +551,58 @@ fn handle_status(service: &QueryService<'_>) -> Result<CallToolResult, Box<dyn s
         "edges": stats.edge_count,
         "files": stats.file_count,
         "unresolved_refs": stats.unresolved_ref_count,
+        "pendingSync": pending_sync,
     });
 
     text(serde_json::to_string_pretty(&output)?)
+}
+
+fn add_staleness_notice(
+    service: &QueryService<'_>,
+    result: &mut CallToolResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pending = service.pending_sync_files()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    for block in &mut result.content {
+        if block.content_type == "text" {
+            block.text = decorate_stale_text(&block.text, &pending);
+        }
+    }
+    Ok(())
+}
+
+fn decorate_stale_text(text: &str, pending: &[PendingSyncFile]) -> String {
+    let referenced = pending
+        .iter()
+        .filter(|file| text.contains(&file.path))
+        .collect::<Vec<_>>();
+
+    if !referenced.is_empty() {
+        let files = referenced
+            .iter()
+            .map(|file| format!("{} edited {}ms ago", file.path, file.age_ms))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "WARNING: Some files referenced below were edited since the last index sync: {files}. \
+Read them directly or run `codegraph sync` for fresh graph results.\n\n{text}"
+        );
+    }
+
+    let files = pending
+        .iter()
+        .take(10)
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{text}\n\n(Note: {} file(s) elsewhere in this project are pending index sync: {files}. \
+Run `codegraph sync` for fresh graph results.)",
+        pending.len()
+    )
 }
 
 fn text(text: String) -> Result<CallToolResult, Box<dyn std::error::Error>> {

@@ -973,6 +973,102 @@ fn mcp_allowlisted_status_and_files_are_service_backed() {
 }
 
 #[test]
+fn mcp_staleness_banner_mentions_referenced_pending_file() {
+    let _guard = mcp_tools_env(None);
+    let dir = fixture_project();
+    fs::write(
+        dir.path().join("app.ts"),
+        "import { helper } from './helper';\nexport function runApp() { return helper() + 10; }\n",
+    )
+    .expect("edit app without sync");
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let result = codegraph::mcp::tools::execute_tool(
+        "codegraph_search",
+        Some(serde_json::json!({"query": "runApp"})),
+        &project,
+        &queries,
+    )
+    .expect("search tool");
+    let text = mcp_text(&result);
+
+    assert_ne!(result.is_error, Some(true), "search failed:\n{text}");
+    assert!(text.starts_with("WARNING:"), "expected stale banner:\n{text}");
+    assert!(text.contains("app.ts"), "expected edited file in banner:\n{text}");
+    assert!(text.contains("runApp"), "expected original search result:\n{text}");
+}
+
+#[test]
+fn mcp_staleness_footer_mentions_elsewhere_pending_file() {
+    let _guard = mcp_tools_env(None);
+    let dir = fixture_project();
+    fs::write(
+        dir.path().join("src").join("worker.ts"),
+        "export function workerMain(name: string) { return name.toLowerCase(); }\n",
+    )
+    .expect("edit worker without sync");
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let result = codegraph::mcp::tools::execute_tool(
+        "codegraph_search",
+        Some(serde_json::json!({"query": "runApp"})),
+        &project,
+        &queries,
+    )
+    .expect("search tool");
+    let text = mcp_text(&result);
+
+    assert_ne!(result.is_error, Some(true), "search failed:\n{text}");
+    assert!(!text.starts_with("WARNING:"), "unexpected banner:\n{text}");
+    assert!(
+        text.contains("elsewhere in this project are pending index sync"),
+        "expected pending footer:\n{text}"
+    );
+    assert!(
+        text.contains("src/worker.ts"),
+        "expected edited file in footer:\n{text}"
+    );
+}
+
+#[test]
+fn mcp_staleness_status_json_lists_pending_sync_files() {
+    let _guard = mcp_tools_env(Some("status"));
+    let dir = fixture_project();
+    fs::write(
+        dir.path().join("src").join("worker.ts"),
+        "export function workerMain(name: string) { return name.toLowerCase(); }\n",
+    )
+    .expect("edit worker without sync");
+    let project =
+        codegraph::project::resolve_project(Some(dir.path().to_str().expect("temp path is utf-8")))
+            .expect("resolve project");
+    let db = project.open_database().expect("open database");
+    let queries = codegraph::db::QueryBuilder::new(db.get_conn());
+
+    let result = codegraph::mcp::tools::execute_tool(
+        "codegraph_status",
+        Some(serde_json::json!({})),
+        &project,
+        &queries,
+    )
+    .expect("status tool");
+    let status: serde_json::Value =
+        serde_json::from_str(&mcp_text(&result)).expect("status tool returns json");
+
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(status["pendingSync"][0]["path"], "src/worker.ts");
+    assert!(status["pendingSync"][0]["ageMs"].as_u64().is_some());
+}
+
+#[test]
 fn mcp_non_default_tool_is_disabled_without_allowlist() {
     let _guard = mcp_tools_env(None);
     let dir = fixture_project();
