@@ -449,6 +449,30 @@ fn go_composite_registry_project() -> TempDir {
     dir
 }
 
+fn go_pointer_conversion_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::write(dir.path().join("go.mod"), "module example.com/proj\n").expect("write go.mod");
+    fs::write(
+        dir.path().join("types.go"),
+        "package main\n\ntype Wrapped struct { N int }\n",
+    )
+    .expect("write types");
+    fs::write(
+        dir.path().join("use.go"),
+        "package main\n\nfunc run(x *int) { _ = (*Wrapped)(x) }\n",
+    )
+    .expect("write use");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn single_file_call_graph_project(file_name: &str, source: &str) -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     fs::write(dir.path().join(file_name), source).expect("write source file");
@@ -2247,6 +2271,24 @@ fn affected_follows_go_package_level_composite_literal() {
         value["affectedTests"],
         serde_json::json!(["reg.go"]),
         "expected registry render.XML literal to make reg.go affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_go_parenthesized_pointer_conversion() {
+    let dir = go_pointer_conversion_project();
+    let output = run_codegraph(
+        &["affected", "types.go", "--json", "--depth", "5", "--filter", "use.go"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["use.go"]),
+        "expected (*Wrapped)(x) conversion to make use.go affected:\n{value}"
     );
 }
 

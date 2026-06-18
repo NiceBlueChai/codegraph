@@ -52,6 +52,14 @@ static GO_COMPOSITE_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid Go composite literal regex")
 });
 
+static GO_TYPE_CONVERSION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r#"\(\s*\*?\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*"#,
+        r#"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)?)\s*\)\s*\("#,
+    ))
+    .expect("valid Go type conversion regex")
+});
+
 static RUBY_METHOD_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?m)^[ \t]*def\s+(?P<name>(?:self\.)?[A-Za-z_][A-Za-z0-9_!?=]*)"#)
         .expect("valid Ruby method regex")
@@ -562,6 +570,15 @@ impl CodeParser {
                 function.body_start,
                 function.body_end,
                 None,
+            );
+            push_go_type_conversion_refs(
+                source,
+                &masked_source,
+                file_path,
+                result,
+                &function.id,
+                function.body_start,
+                function.body_end,
             );
             let body = &masked_source[function.body_start..function.body_end];
             for captures in GO_CALL_RE.captures_iter(body) {
@@ -1136,6 +1153,45 @@ fn push_go_composite_refs(
             from_node_id: from_node_id.to_string(),
             reference_name: name,
             reference_kind: "new".to_string(),
+            line,
+            col,
+            candidates: None,
+            file_path: file_path.to_string(),
+            language: Language::Go.as_str().to_string(),
+        });
+    }
+}
+
+fn push_go_type_conversion_refs(
+    source: &str,
+    masked_source: &str,
+    file_path: &str,
+    result: &mut ExtractionResult,
+    from_node_id: &str,
+    start: usize,
+    end: usize,
+) {
+    if start >= end || end > masked_source.len() {
+        return;
+    }
+
+    let slice = &masked_source[start..end];
+    for captures in GO_TYPE_CONVERSION_RE.captures_iter(slice) {
+        let Some(name_match) = captures.name("name") else {
+            continue;
+        };
+        let name = normalize_go_composite_type(name_match.as_str());
+        if name.is_empty() || is_go_keyword(name.rsplit('.').next().unwrap_or(&name)) {
+            continue;
+        }
+
+        let absolute_start = start + name_match.start();
+        let (line, col) = byte_position(source, absolute_start);
+        result.unresolved_refs.push(UnresolvedReference {
+            id: Some(0),
+            from_node_id: from_node_id.to_string(),
+            reference_name: name,
+            reference_kind: "call".to_string(),
             line,
             col,
             candidates: None,
