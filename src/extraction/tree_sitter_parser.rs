@@ -156,12 +156,21 @@ impl TreeSitterParser {
             // Rust-specific
             "function_item" => {
                 if *lang == Language::Rust {
-                    self.extract_rust_function(node, source, file_path, result);
+                    if find_parent_kind(node, "impl_item").is_some() {
+                        self.extract_rust_impl_method(node, source, file_path, result);
+                    } else {
+                        self.extract_rust_function(node, source, file_path, result);
+                    }
                 }
             }
             "struct_item" => {
                 if *lang == Language::Rust {
                     self.extract_rust_struct(node, source, file_path, result);
+                }
+            }
+            "trait_item" => {
+                if *lang == Language::Rust {
+                    self.extract_rust_trait(node, source, file_path, result);
                 }
             }
             "impl_item" => {
@@ -705,14 +714,156 @@ impl TreeSitterParser {
         file_path: &str,
         result: &mut ExtractionResult,
     ) {
-        // Extract impl methods
+        let Some((trait_name, type_name)) = rust_impl_trait_and_type(&self.get_node_text(node, source)) else {
+            return;
+        };
+        let Some(type_node) = result.nodes.iter().find(|candidate| {
+            candidate.language == Language::Rust
+                && matches!(candidate.kind, NodeKind::Struct | NodeKind::Enum | NodeKind::Class)
+                && candidate.name == type_name
+        }) else {
+            return;
+        };
+
+        result.unresolved_refs.push(UnresolvedReference {
+            id: Some(0),
+            from_node_id: type_node.id.clone(),
+            reference_name: trait_name,
+            reference_kind: "implements".to_string(),
+            line: (node.start_position().row + 1) as u32,
+            col: node.start_position().column as u32,
+            candidates: None,
+            file_path: file_path.to_string(),
+            language: Language::Rust.as_str().to_string(),
+        });
+    }
+
+    fn extract_rust_trait(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let id = format!("{}::{}#{}", file_path, name, start.row + 1);
+        let mut trait_node = Node::new(
+            id.clone(),
+            NodeKind::Trait,
+            name.clone(),
+            format!("{}::{}", file_path, name),
+            file_path.to_string(),
+            Language::Rust,
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        trait_node.visibility = Some(if self.has_child_text(node, "pub") {
+            "public".to_string()
+        } else {
+            "private".to_string()
+        });
+        trait_node.is_exported = trait_node.visibility.as_deref() == Some("public");
+        result.nodes.push(trait_node);
+
         if let Some(body) = self.find_child(node, "declaration_list") {
             let mut cursor = body.walk();
             for child in body.named_children(&mut cursor) {
-                if child.kind() == "function_item" {
-                    self.extract_rust_function(child, source, file_path, result);
+                if child.kind() == "function_signature_item" {
+                    self.extract_rust_trait_method(child, source, file_path, result, &id, &name);
                 }
             }
+        }
+    }
+
+    fn extract_rust_trait_method(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+        trait_id: &str,
+        trait_name: &str,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        let method_id = format!("{}::{}.{}#{}", file_path, trait_name, name, start.row + 1);
+        let mut method = Node::new(
+            method_id.clone(),
+            NodeKind::Method,
+            name.clone(),
+            format!("{}::{}.{}", file_path, trait_name, name),
+            file_path.to_string(),
+            Language::Rust,
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        method.signature = Some(self.get_node_text(node, source));
+        result.nodes.push(method);
+        result.edges.push(Edge::new(
+            trait_id.to_string(),
+            method_id,
+            EdgeKind::Contains,
+        ));
+    }
+
+    fn extract_rust_impl_method(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let name = self.get_child_text(node, "name", source).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        let Some(impl_node) = find_parent_kind(node, "impl_item") else {
+            return;
+        };
+        let owner = rust_impl_self_type(&self.get_node_text(impl_node, source))
+            .unwrap_or_else(|| "impl".to_string());
+        let start = node.start_position();
+        let end = node.end_position();
+        let method_id = format!("{}::{}#{}", file_path, name, start.row + 1);
+        let mut method = Node::new(
+            method_id.clone(),
+            NodeKind::Method,
+            name.clone(),
+            format!("{}::{}.{}", file_path, owner, name),
+            file_path.to_string(),
+            Language::Rust,
+            (start.row + 1) as u32,
+            (end.row + 1) as u32,
+            start.column as u32,
+            end.column as u32,
+        );
+        method.signature = Some(self.get_node_text(node, source));
+        result.nodes.push(method);
+        if let Some(owner_node) = result.nodes.iter().find(|candidate| {
+            candidate.language == Language::Rust
+                && matches!(candidate.kind, NodeKind::Struct | NodeKind::Enum | NodeKind::Class)
+                && candidate.name == owner
+        }) {
+            result.edges.push(Edge::new(
+                owner_node.id.clone(),
+                method_id,
+                EdgeKind::Contains,
+            ));
         }
     }
 
@@ -932,6 +1083,42 @@ fn rust_type_leaf_name(raw_name: &str) -> String {
         .unwrap_or(raw_name)
         .trim()
         .to_string()
+}
+
+fn find_parent_kind<'a>(
+    mut node: TSTreeSitterNode<'a>,
+    kind: &str,
+) -> Option<TSTreeSitterNode<'a>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == kind {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn rust_impl_trait_and_type(impl_text: &str) -> Option<(String, String)> {
+    let header = impl_text.split('{').next()?.trim();
+    let after_impl = header.strip_prefix("impl")?.trim();
+    let (trait_part, type_part) = after_impl.split_once(" for ")?;
+    let trait_name = rust_type_leaf_name(trait_part);
+    let type_name = rust_type_leaf_name(type_part.split_whitespace().next().unwrap_or(type_part));
+    if trait_name.is_empty() || type_name.is_empty() {
+        return None;
+    }
+    Some((trait_name, type_name))
+}
+
+fn rust_impl_self_type(impl_text: &str) -> Option<String> {
+    let header = impl_text.split('{').next()?.trim();
+    let after_impl = header.strip_prefix("impl")?.trim();
+    let type_part = after_impl
+        .split_once(" for ")
+        .map(|(_, implemented_type)| implemented_type)
+        .unwrap_or(after_impl);
+    let type_name = rust_type_leaf_name(type_part.split_whitespace().next().unwrap_or(type_part));
+    (!type_name.is_empty()).then_some(type_name)
 }
 
 #[cfg(test)]

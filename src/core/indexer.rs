@@ -183,6 +183,11 @@ impl<'a> Indexer<'a> {
             }
         }
 
+        let rust_edges = self.synthesize_rust_trait_impl_edges()?;
+        if !rust_edges.is_empty() {
+            result.edges_created += self.queries.insert_edges_batch(&rust_edges)?;
+        }
+
         result.duration_ms = start.elapsed().as_millis() as u64;
         info!("Indexed {} files, {} nodes, {} edges in {}ms",
             result.files_indexed, result.nodes_created, result.edges_created, result.duration_ms);
@@ -299,6 +304,102 @@ impl<'a> Indexer<'a> {
                             EdgeKind::Calls,
                         );
                         edge.line = Some(wanted.start_line);
+                        edge.provenance = Some(Provenance::Heuristic);
+                        edges.push(edge);
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    fn synthesize_rust_trait_impl_edges(&self) -> Result<Vec<Edge>, Box<dyn std::error::Error>> {
+        let nodes = self.queries.get_all_nodes()?;
+        let nodes_by_id: HashMap<String, Node> = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.clone()))
+            .collect();
+
+        let mut edges = Vec::new();
+        let mut seen = HashSet::new();
+        for node in &nodes {
+            for edge in self.queries.get_outgoing_edges(&node.id)? {
+                seen.insert(go_edge_key(&edge.source, &edge.target, &edge.kind));
+            }
+        }
+
+        let mut methods_by_owner: HashMap<String, Vec<Node>> = HashMap::new();
+        for owner in nodes.iter().filter(|node| {
+            node.language == Language::Rust
+                && matches!(
+                    node.kind,
+                    NodeKind::Struct | NodeKind::Enum | NodeKind::Class | NodeKind::Trait
+                )
+        }) {
+            for edge in self.queries.get_outgoing_edges(&owner.id)? {
+                if edge.kind != EdgeKind::Contains {
+                    continue;
+                }
+                let Some(method) = nodes_by_id.get(&edge.target) else {
+                    continue;
+                };
+                if method.language == Language::Rust && method.kind == NodeKind::Method {
+                    methods_by_owner
+                        .entry(owner.id.clone())
+                        .or_default()
+                        .push(method.clone());
+                }
+            }
+        }
+
+        for node in &nodes {
+            for edge in self.queries.get_outgoing_edges(&node.id)? {
+                if edge.kind != EdgeKind::Implements {
+                    continue;
+                }
+                let Some(implementer) = nodes_by_id.get(&edge.source) else {
+                    continue;
+                };
+                let Some(trait_node) = nodes_by_id.get(&edge.target) else {
+                    continue;
+                };
+                if implementer.language != Language::Rust
+                    || trait_node.language != Language::Rust
+                    || !matches!(
+                        implementer.kind,
+                        NodeKind::Struct | NodeKind::Enum | NodeKind::Class
+                    )
+                    || trait_node.kind != NodeKind::Trait
+                {
+                    continue;
+                }
+                let Some(trait_methods) = methods_by_owner.get(&trait_node.id) else {
+                    continue;
+                };
+                let Some(impl_methods) = methods_by_owner.get(&implementer.id) else {
+                    continue;
+                };
+
+                for trait_method in trait_methods {
+                    for impl_method in impl_methods
+                        .iter()
+                        .filter(|method| method.name == trait_method.name)
+                    {
+                        let bridge_key = go_edge_key(
+                            &trait_method.id,
+                            &impl_method.id,
+                            &EdgeKind::Calls,
+                        );
+                        if !seen.insert(bridge_key) {
+                            continue;
+                        }
+                        let mut edge = Edge::new(
+                            trait_method.id.clone(),
+                            impl_method.id.clone(),
+                            EdgeKind::Calls,
+                        );
+                        edge.line = Some(trait_method.start_line);
                         edge.provenance = Some(Provenance::Heuristic);
                         edges.push(edge);
                     }
@@ -436,6 +537,11 @@ impl<'a> Indexer<'a> {
             }
         }
 
+        let rust_edges = self.synthesize_rust_trait_impl_edges()?;
+        if !rust_edges.is_empty() {
+            self.queries.insert_edges_batch(&rust_edges)?;
+        }
+
         result.duration_ms = start.elapsed().as_millis() as u64;
         info!("Sync complete: {} added, {} modified, {} removed in {}ms",
             result.files_added, result.files_modified, result.files_removed, result.duration_ms);
@@ -539,6 +645,11 @@ impl<'a> Indexer<'a> {
                     info!("Reference resolution encountered errors: {}", e);
                 }
             }
+        }
+
+        let rust_edges = self.synthesize_rust_trait_impl_edges()?;
+        if !rust_edges.is_empty() {
+            self.queries.insert_edges_batch(&rust_edges)?;
         }
 
         result.duration_ms = start.elapsed().as_millis() as u64;

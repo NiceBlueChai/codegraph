@@ -275,7 +275,9 @@ impl<'a> Resolver<'a> {
         if let Some(candidates) = ctx.nodes_by_qualified_name.get(&ref_name.to_lowercase()) {
             // Filter by language family
             for candidate in candidates {
-                if self.same_language_family(lang, &candidate.language) {
+                if self.same_language_family(lang, &candidate.language)
+                    && candidate_matches_reference_kind(&uref.reference_kind, candidate)
+                {
                     return Some(ResolvedReference {
                         from_node_id: uref.from_node_id.clone(),
                         target_node_id: candidate.id.clone(),
@@ -358,7 +360,13 @@ impl<'a> Resolver<'a> {
     ) -> Option<ResolvedReference> {
         let ref_name = &uref.reference_name;
 
-        let candidates = ctx.get_family_candidates(lang, ref_name);
+        let candidates = ctx
+            .get_family_candidates(lang, ref_name)
+            .into_iter()
+            .filter(|candidate| {
+                candidate_matches_reference_kind(&uref.reference_kind, candidate)
+            })
+            .collect::<Vec<_>>();
         for candidate in &candidates {
             // Prefer exported/public symbols
             if candidate.is_exported {
@@ -403,7 +411,9 @@ impl<'a> Resolver<'a> {
         for (name, candidates) in &ctx.nodes_by_name {
             if name.contains(&ref_name_lower) || ref_name_lower.contains(name) {
                 for candidate in candidates {
-                    if self.same_language_family(lang, &candidate.language) {
+                    if self.same_language_family(lang, &candidate.language)
+                        && candidate_matches_reference_kind(&uref.reference_kind, candidate)
+                    {
                         return Some(ResolvedReference {
                             from_node_id: uref.from_node_id.clone(),
                             target_node_id: candidate.id.clone(),
@@ -474,6 +484,16 @@ impl<'a> Resolver<'a> {
         }
 
         Ok(())
+    }
+}
+
+fn candidate_matches_reference_kind(reference_kind: &str, candidate: &Node) -> bool {
+    match reference_kind {
+        "implements" | "interface" | "extends" | "inherits" | "type" | "type_ref" => {
+            is_type_like_node(&candidate.kind)
+        }
+        "instantiation" | "new" => is_type_like_node(&candidate.kind),
+        _ => true,
     }
 }
 
