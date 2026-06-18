@@ -1,7 +1,7 @@
 //! Source-file parsing and lightweight fallback extractors for supported languages.
 
 use crate::extraction::tree_sitter_parser::TreeSitterParser;
-use crate::types::{ExtractionResult, Language, Node, NodeKind, UnresolvedReference};
+use crate::types::{Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, UnresolvedReference};
 use log::debug;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -63,6 +63,11 @@ static GO_TYPE_CONVERSION_RE: Lazy<Regex> = Lazy::new(|| {
 static GO_VAR_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?m)^[ \t]*var\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b[^\n]*"#)
         .expect("valid Go variable regex")
+});
+
+static GO_INTERFACE_METHOD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)^[ \t]*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\("#)
+        .expect("valid Go interface method regex")
 });
 
 static RUBY_METHOD_RE: Lazy<Regex> = Lazy::new(|| {
@@ -626,6 +631,9 @@ impl CodeParser {
 
     fn extract_go_types(source: &str, file_path: &str, result: &mut ExtractionResult) {
         for captures in GO_TYPE_RE.captures_iter(source) {
+            let Some(full_match) = captures.get(0) else {
+                continue;
+            };
             let Some(kind_match) = captures.name("kind") else {
                 continue;
             };
@@ -633,11 +641,19 @@ impl CodeParser {
                 continue;
             };
             let name = name_match.as_str().to_string();
+            let interface_body = if kind_match.as_str() == "interface" {
+                find_go_type_body(source, full_match.end())
+            } else {
+                None
+            };
             let kind = match kind_match.as_str() {
                 "struct" => NodeKind::Struct,
                 _ => NodeKind::Interface,
             };
             let (line, col) = byte_position(source, name_match.start());
+            let (end_line, end_col) = interface_body
+                .map(|(_, close_brace)| byte_position(source, close_brace))
+                .unwrap_or((line, col + name.len() as u32));
             let mut node = Node::new(
                 format!("{}::{}#{}", file_path, name, line),
                 kind,
@@ -646,12 +662,16 @@ impl CodeParser {
                 file_path.to_string(),
                 Language::Go,
                 line,
-                line,
+                end_line,
                 col,
-                col + name.len() as u32,
+                end_col,
             );
             node.is_exported = is_go_exported(&name);
+            let type_id = node.id.clone();
             result.nodes.push(node);
+            if let Some((body_start, body_end)) = interface_body {
+                extract_go_interface_methods(source, file_path, result, &type_id, &name, body_start, body_end);
+            }
         }
     }
 
@@ -1315,6 +1335,64 @@ fn go_initializer_end(source: &str, init_start: usize, line_end: usize) -> usize
         }
     }
     bounded_line_end
+}
+
+fn find_go_type_body(source: &str, search_start: usize) -> Option<(usize, usize)> {
+    let start = search_start.min(source.len());
+    let open_brace = source[start..].find('{').map(|offset| start + offset)?;
+    let close_brace = find_matching_brace(source, open_brace)?;
+    Some((open_brace + 1, close_brace))
+}
+
+fn extract_go_interface_methods(
+    source: &str,
+    file_path: &str,
+    result: &mut ExtractionResult,
+    interface_id: &str,
+    interface_name: &str,
+    body_start: usize,
+    body_end: usize,
+) {
+    if body_start >= body_end || body_end > source.len() {
+        return;
+    }
+
+    let body = &source[body_start..body_end];
+    for captures in GO_INTERFACE_METHOD_RE.captures_iter(body) {
+        let Some(name_match) = captures.name("name") else {
+            continue;
+        };
+        let name = name_match.as_str().to_string();
+        if name.is_empty() || is_go_keyword(&name) {
+            continue;
+        }
+
+        let absolute_start = body_start + name_match.start();
+        let line_end = find_line_end(source, absolute_start);
+        let (line, col) = byte_position(source, absolute_start);
+        let (end_line, end_col) = byte_position(source, line_end);
+        let method_id = format!("{}::{}.{}#{}", file_path, interface_name, name, line);
+        let mut method = Node::new(
+            method_id.clone(),
+            NodeKind::Method,
+            name.clone(),
+            format!("{}::{}.{}", file_path, interface_name, name),
+            file_path.to_string(),
+            Language::Go,
+            line,
+            end_line,
+            col,
+            end_col,
+        );
+        method.signature = Some(source[absolute_start..line_end].trim().to_string());
+        method.is_exported = is_go_exported(&name);
+        result.nodes.push(method);
+        result.edges.push(Edge::new(
+            interface_id.to_string(),
+            method_id,
+            EdgeKind::Contains,
+        ));
+    }
 }
 
 fn is_go_named_composite_literal(source: &str, name_start: usize) -> bool {

@@ -503,6 +503,42 @@ fn go_top_level_closure_project() -> TempDir {
     dir
 }
 
+fn go_implicit_interface_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("codec")).expect("create codec");
+    fs::write(dir.path().join("go.mod"), "module example.com/proj\n").expect("write go.mod");
+    fs::write(
+        dir.path().join("codec").join("api.go"),
+        concat!(
+            "package codec\n\n",
+            "type Core interface {\n",
+            "    Marshal(v any) ([]byte, error)\n",
+            "}\n\n",
+            "var API Core\n",
+        ),
+    )
+    .expect("write api");
+    fs::write(
+        dir.path().join("codec").join("json.go"),
+        concat!(
+            "package codec\n\n",
+            "type jsonApi struct{}\n\n",
+            "func (j jsonApi) Marshal(v any) ([]byte, error) { return nil, nil }\n\n",
+            "func init() { API = jsonApi{} }\n",
+        ),
+    )
+    .expect("write json");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn single_file_call_graph_project(file_name: &str, source: &str) -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     fs::write(dir.path().join(file_name), source).expect("write source file");
@@ -2340,6 +2376,24 @@ fn go_top_level_closure_call_is_attributed_to_variable() {
     assert!(
         callers.iter().all(|node| node["kind"] != "file"),
         "closure call must not be attributed to a file node:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_go_implicit_interface_implementation() {
+    let dir = go_implicit_interface_project();
+    let output = run_codegraph(
+        &["affected", "codec/json.go", "--json", "--depth", "5", "--filter", "codec/api.go"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["codec/api.go"]),
+        "expected Core interface to depend on jsonApi implementation:\n{value}"
     );
 }
 

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use log::info;
 use sha2::{Sha256, Digest};
@@ -161,6 +162,11 @@ impl<'a> Indexer<'a> {
             result.edges_created += parsed.extraction.edges.len();
         }
 
+        let go_edges = self.synthesize_go_implicit_interface_edges()?;
+        if !go_edges.is_empty() {
+            result.edges_created += self.queries.insert_edges_batch(&go_edges)?;
+        }
+
         // Phase 4: Resolve references
         if !all_unresolved_refs.is_empty() {
             info!("Resolving {} unresolved references...", all_unresolved_refs.len());
@@ -181,6 +187,126 @@ impl<'a> Indexer<'a> {
         info!("Indexed {} files, {} nodes, {} edges in {}ms",
             result.files_indexed, result.nodes_created, result.edges_created, result.duration_ms);
         Ok(result)
+    }
+
+    fn synthesize_go_implicit_interface_edges(&self) -> Result<Vec<Edge>, Box<dyn std::error::Error>> {
+        let nodes = self.queries.get_all_nodes()?;
+        let mut types_by_package_name: HashMap<(String, String), Node> = HashMap::new();
+        for node in &nodes {
+            if node.language != Language::Go {
+                continue;
+            }
+            if matches!(node.kind, NodeKind::Struct | NodeKind::Interface) {
+                types_by_package_name.insert(
+                    (go_package_dir(&node.file_path), node.name.clone()),
+                    node.clone(),
+                );
+            }
+        }
+
+        let mut edges = Vec::new();
+        let mut seen = HashSet::new();
+        for node in &nodes {
+            for edge in self.queries.get_outgoing_edges(&node.id)? {
+                seen.insert(go_edge_key(&edge.source, &edge.target, &edge.kind));
+            }
+        }
+        let mut struct_methods: HashMap<String, Vec<Node>> = HashMap::new();
+        let mut interface_methods: HashMap<String, Vec<Node>> = HashMap::new();
+
+        for method in nodes.iter().filter(|node| {
+            node.language == Language::Go && node.kind == NodeKind::Method
+        }) {
+            let Some(owner_name) = go_method_owner_name(&method.qualified_name) else {
+                continue;
+            };
+            let owner_key = (go_package_dir(&method.file_path), owner_name);
+            let Some(owner) = types_by_package_name.get(&owner_key) else {
+                continue;
+            };
+
+            match owner.kind {
+                NodeKind::Struct => {
+                    let contains_key = go_edge_key(&owner.id, &method.id, &EdgeKind::Contains);
+                    if seen.insert(contains_key) {
+                        edges.push(Edge::new(
+                            owner.id.clone(),
+                            method.id.clone(),
+                            EdgeKind::Contains,
+                        ));
+                    }
+                    struct_methods
+                        .entry(owner.id.clone())
+                        .or_default()
+                        .push(method.clone());
+                }
+                NodeKind::Interface => {
+                    interface_methods
+                        .entry(owner.id.clone())
+                        .or_default()
+                        .push(method.clone());
+                }
+                _ => {}
+            }
+        }
+
+        for (interface_id, wanted_methods) in &interface_methods {
+            if wanted_methods.is_empty() {
+                continue;
+            }
+            let Some(interface_node) = nodes.iter().find(|node| node.id == *interface_id) else {
+                continue;
+            };
+            let wanted_names = wanted_methods
+                .iter()
+                .map(|method| method.name.as_str())
+                .collect::<HashSet<_>>();
+            for (struct_id, methods) in &struct_methods {
+                let Some(struct_node) = nodes.iter().find(|node| node.id == *struct_id) else {
+                    continue;
+                };
+                if go_package_dir(&struct_node.file_path) != go_package_dir(&interface_node.file_path) {
+                    continue;
+                }
+                let have_names = methods
+                    .iter()
+                    .map(|method| method.name.as_str())
+                    .collect::<HashSet<_>>();
+                if !wanted_names.iter().all(|name| have_names.contains(name)) {
+                    continue;
+                }
+
+                let implements_key = go_edge_key(&struct_node.id, &interface_node.id, &EdgeKind::Implements);
+                if seen.insert(implements_key) {
+                    let mut edge = Edge::new(
+                        struct_node.id.clone(),
+                        interface_node.id.clone(),
+                        EdgeKind::Implements,
+                    );
+                    edge.provenance = Some(Provenance::Heuristic);
+                    edges.push(edge);
+                }
+
+                for wanted in wanted_methods {
+                    for implementation in methods.iter().filter(|method| method.name == wanted.name) {
+                        let bridge_key = go_edge_key(&wanted.id, &implementation.id, &EdgeKind::Calls);
+                        if !seen.insert(bridge_key) {
+                            continue;
+                        }
+                        let mut edge = Edge::new(
+                            wanted.id.clone(),
+                            implementation.id.clone(),
+                            EdgeKind::Calls,
+                        );
+                        edge.line = Some(wanted.start_line);
+                        edge.provenance = Some(Provenance::Heuristic);
+                        edges.push(edge);
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
     }
 
     /// Incremental sync - only process changed files and detect deletions
@@ -287,6 +413,11 @@ impl<'a> Indexer<'a> {
             if let Some(ref mut paths) = result.changed_file_paths {
                 paths.push(rel_path);
             }
+        }
+
+        let go_edges = self.synthesize_go_implicit_interface_edges()?;
+        if !go_edges.is_empty() {
+            self.queries.insert_edges_batch(&go_edges)?;
         }
 
         // Resolve references for changed files
@@ -445,6 +576,24 @@ impl<'a> Indexer<'a> {
         let rel = path.strip_prefix(&self.project_root)?;
         Ok(rel.to_string_lossy().replace('\\', "/"))
     }
+}
+
+fn go_package_dir(file_path: &str) -> String {
+    file_path
+        .replace('\\', "/")
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default()
+}
+
+fn go_method_owner_name(qualified_name: &str) -> Option<String> {
+    let symbol = qualified_name.rsplit_once("::")?.1;
+    let (owner, _) = symbol.rsplit_once('.')?;
+    (!owner.is_empty()).then(|| owner.to_string())
+}
+
+fn go_edge_key(source: &str, target: &str, kind: &EdgeKind) -> String {
+    format!("{}>{}:{}", source, target, kind.as_str())
 }
 
 #[cfg(test)]
