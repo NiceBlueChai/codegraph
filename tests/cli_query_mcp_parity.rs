@@ -925,6 +925,81 @@ fn rust_trait_impl_project() -> TempDir {
     dir
 }
 
+fn rust_module_path_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("src").join("http")).expect("create http");
+    fs::create_dir_all(dir.path().join("src").join("routes")).expect("create routes");
+    fs::create_dir_all(dir.path().join("src").join("database")).expect("create database");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write cargo");
+    fs::write(
+        dir.path().join("src").join("lib.rs"),
+        concat!(
+            "pub mod http;\n",
+            "pub mod database;\n",
+            "pub mod routes;\n",
+            "pub mod other;\n",
+        ),
+    )
+    .expect("write lib");
+    fs::write(
+        dir.path().join("src").join("http").join("mod.rs"),
+        concat!(
+            "mod users;\n",
+            "mod profiles;\n",
+            "pub fn api_router() {\n",
+            "    users::router();\n",
+            "    profiles::router();\n",
+            "}\n",
+        ),
+    )
+    .expect("write http mod");
+    fs::write(
+        dir.path().join("src").join("http").join("users.rs"),
+        "pub fn router() -> i32 { 1 }\n",
+    )
+    .expect("write users");
+    fs::write(
+        dir.path().join("src").join("http").join("profiles.rs"),
+        "pub fn router() -> i32 { 2 }\n",
+    )
+    .expect("write profiles");
+    fs::write(
+        dir.path().join("src").join("database").join("mod.rs"),
+        "pub mod profiles;\n",
+    )
+    .expect("write database mod");
+    fs::write(
+        dir.path().join("src").join("database").join("profiles.rs"),
+        "pub fn find(id: i32) -> i32 { id }\n",
+    )
+    .expect("write database profiles");
+    fs::write(dir.path().join("src").join("other.rs"), "pub fn find() -> i32 { 0 }\n")
+        .expect("write other");
+    fs::write(
+        dir.path().join("src").join("routes").join("mod.rs"),
+        concat!(
+            "use crate::database;\n",
+            "pub fn get_profile(id: i32) -> i32 {\n",
+            "    database::profiles::find(id)\n",
+            "}\n",
+        ),
+    )
+    .expect("write routes");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn java_annotation_project() -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     fs::create_dir_all(dir.path().join("p")).expect("create p");
@@ -2346,6 +2421,52 @@ fn affected_follows_rust_trait_implementation() {
         value["affectedTests"],
         serde_json::json!(["src/consumer.rs"]),
         "expected impl Render for Mine to make consumer.rs affected:\n{value}"
+    );
+}
+
+#[test]
+fn affected_follows_rust_self_relative_module_path_call() {
+    let dir = rust_module_path_project();
+    for changed in ["src/http/users.rs", "src/http/profiles.rs"] {
+        let output = run_codegraph(
+            &["affected", changed, "--json", "--depth", "5", "--filter", "src/http/mod.rs"],
+            dir.path(),
+        );
+        assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+        assert_eq!(
+            value["affectedTests"],
+            serde_json::json!(["src/http/mod.rs"]),
+            "expected {changed} router to make http/mod.rs affected:\n{value}"
+        );
+    }
+}
+
+#[test]
+fn affected_follows_rust_multi_segment_module_path_call() {
+    let dir = rust_module_path_project();
+    let output = run_codegraph(
+        &[
+            "affected",
+            "src/database/profiles.rs",
+            "--json",
+            "--depth",
+            "5",
+            "--filter",
+            "src/routes/mod.rs",
+        ],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["src/routes/mod.rs"]),
+        "expected database::profiles::find to make routes/mod.rs affected:\n{value}"
     );
 }
 

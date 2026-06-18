@@ -15,6 +15,8 @@ pub struct ResolutionContext {
     nodes_by_qualified_name: HashMap<String, Vec<Node>>,
     /// All file nodes indexed by path
     nodes_by_file_path: HashMap<String, Node>,
+    /// All nodes indexed by their containing file path
+    nodes_by_file: HashMap<String, Vec<Node>>,
     /// Nodes indexed by language family
     nodes_by_family: HashMap<String, Vec<Node>>,
 }
@@ -25,12 +27,18 @@ impl ResolutionContext {
             nodes_by_name: HashMap::new(),
             nodes_by_qualified_name: HashMap::new(),
             nodes_by_file_path: HashMap::new(),
+            nodes_by_file: HashMap::new(),
             nodes_by_family: HashMap::new(),
         };
 
         // Load all non-file nodes
         let nodes = queries.get_all_nodes()?;
         for node in nodes {
+            ctx.nodes_by_file
+                .entry(node.file_path.clone())
+                .or_insert_with(Vec::new)
+                .push(node.clone());
+
             // Index by name (lowercase)
             let name_lower = node.name.to_lowercase();
             ctx.nodes_by_name
@@ -152,22 +160,27 @@ impl<'a> Resolver<'a> {
             return Some(result);
         }
 
-        // Strategy 3: Qualified name match
+        // Strategy 3: Rust module-path reference match
+        if let Some(result) = self.match_rust_path_reference(uref, ctx, &lang) {
+            return Some(result);
+        }
+
+        // Strategy 4: Qualified name match
         if let Some(result) = self.match_by_qualified_name(uref, ctx, &lang) {
             return Some(result);
         }
 
-        // Strategy 4: Method call pattern (obj.method, Class::method)
+        // Strategy 5: Method call pattern (obj.method, Class::method)
         if let Some(result) = self.match_method_call(uref, ctx, &lang) {
             return Some(result);
         }
 
-        // Strategy 5: Exact name match (within language family)
+        // Strategy 6: Exact name match (within language family)
         if let Some(result) = self.match_by_exact_name(uref, ctx, &lang) {
             return Some(result);
         }
 
-        // Strategy 6: Fuzzy match (lowest confidence)
+        // Strategy 7: Fuzzy match (lowest confidence)
         if let Some(result) = self.match_fuzzy(uref, ctx, &lang) {
             return Some(result);
         }
@@ -237,6 +250,57 @@ impl<'a> Resolver<'a> {
         }
 
         None
+    }
+
+    fn match_rust_path_reference(
+        &self,
+        uref: &UnresolvedReference,
+        ctx: &ResolutionContext,
+        lang: &Language,
+    ) -> Option<ResolvedReference> {
+        if *lang != Language::Rust || !uref.reference_name.contains("::") {
+            return None;
+        }
+        let segments = uref
+            .reference_name
+            .split("::")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.len() < 2 {
+            return None;
+        }
+        let leaf = segments.last().copied()?;
+        let module_file = rust_resolve_module_file(&segments[..segments.len() - 1], &uref.file_path, ctx)?;
+        if module_file == uref.file_path {
+            return None;
+        }
+
+        let target = ctx.nodes_by_file.get(&module_file)?.iter().find(|node| {
+            node.name == leaf
+                && matches!(
+                    node.kind,
+                    NodeKind::Function
+                        | NodeKind::Struct
+                        | NodeKind::Enum
+                        | NodeKind::Trait
+                        | NodeKind::TypeAlias
+                        | NodeKind::Constant
+                        | NodeKind::Method
+                        | NodeKind::Class
+                        | NodeKind::Interface
+                )
+        })?;
+
+        Some(ResolvedReference {
+            from_node_id: uref.from_node_id.clone(),
+            target_node_id: target.id.clone(),
+            edge_kind: self.infer_edge_kind(&uref.reference_kind),
+            confidence: 0.9,
+            strategy: ResolutionStrategy::ImportPath,
+            line: uref.line,
+            col: uref.col,
+        })
     }
 
     /// Strategy 1: Match by file path (e.g., "src/utils.ts" -> file node)
@@ -596,6 +660,85 @@ fn rust_use_module_file_path(file_path: &str, use_path: &str) -> Option<String> 
     }
 }
 
+fn rust_resolve_module_file(
+    segments: &[&str],
+    from_file: &str,
+    ctx: &ResolutionContext,
+) -> Option<String> {
+    if segments.is_empty() {
+        return None;
+    }
+
+    match segments[0] {
+        "crate" => rust_resolve_under(rust_crate_root_dir(from_file, ctx), &segments[1..], ctx),
+        "self" => rust_resolve_under(Some(rust_self_module_dir(from_file)), &segments[1..], ctx),
+        "super" => {
+            let supers = segments.iter().take_while(|segment| **segment == "super").count();
+            let mut dir = Some(rust_self_module_dir(from_file));
+            for _ in 0..supers {
+                dir = dir.and_then(|current| parent_dir(&current));
+            }
+            rust_resolve_under(dir, &segments[supers..], ctx)
+        }
+        _ => rust_resolve_under(Some(rust_self_module_dir(from_file)), segments, ctx)
+            .or_else(|| rust_resolve_under(rust_crate_root_dir(from_file, ctx), segments, ctx)),
+    }
+}
+
+fn rust_resolve_under(
+    start_dir: Option<String>,
+    segments: &[&str],
+    ctx: &ResolutionContext,
+) -> Option<String> {
+    let mut dir = start_dir?;
+    let mut target_file = None;
+    for segment in segments {
+        if matches!(*segment, "self" | "crate" | "super") {
+            continue;
+        }
+        let as_file = join_path(&dir, &format!("{}.rs", segment));
+        let as_mod = join_path(&join_path(&dir, segment), "mod.rs");
+        if ctx.nodes_by_file_path.contains_key(&as_file) {
+            target_file = Some(as_file);
+        } else if ctx.nodes_by_file_path.contains_key(&as_mod) {
+            target_file = Some(as_mod);
+        } else {
+            return None;
+        }
+        dir = join_path(&dir, segment);
+    }
+    target_file
+}
+
+fn rust_crate_root_dir(from_file: &str, ctx: &ResolutionContext) -> Option<String> {
+    let mut dir = parent_dir(from_file)?;
+    for _ in 0..64 {
+        if ctx.nodes_by_file_path.contains_key(&join_path(&dir, "lib.rs"))
+            || ctx.nodes_by_file_path.contains_key(&join_path(&dir, "main.rs"))
+        {
+            return Some(dir);
+        }
+        dir = parent_dir(&dir)?;
+    }
+    None
+}
+
+fn rust_self_module_dir(from_file: &str) -> String {
+    let path = from_file.replace('\\', "/");
+    if let Some(dir) = path.strip_suffix("/mod.rs") {
+        return dir.to_string();
+    }
+    if let Some(dir) = path.strip_suffix("/lib.rs") {
+        return dir.to_string();
+    }
+    if let Some(dir) = path.strip_suffix("/main.rs") {
+        return dir.to_string();
+    }
+    path.strip_suffix(".rs")
+        .map(str::to_string)
+        .unwrap_or(path)
+}
+
 fn rust_current_module_dir(file_path: &str) -> String {
     let path = file_path.replace('\\', "/");
     if let Some(dir) = path.strip_suffix("/mod.rs") {
@@ -604,6 +747,22 @@ fn rust_current_module_dir(file_path: &str) -> String {
     path.rsplit_once('/')
         .map(|(dir, _)| dir.to_string())
         .unwrap_or_default()
+}
+
+fn join_path(left: &str, right: &str) -> String {
+    if left.is_empty() {
+        right.replace('\\', "/")
+    } else if right.is_empty() {
+        left.replace('\\', "/")
+    } else {
+        format!("{}/{}", left.trim_end_matches('/'), right.trim_start_matches('/')).replace('\\', "/")
+    }
+}
+
+fn parent_dir(path: &str) -> Option<String> {
+    path.replace('\\', "/")
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
 }
 
 fn normalize_relative_path(path: &str) -> String {
