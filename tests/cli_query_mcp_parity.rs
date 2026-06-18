@@ -473,6 +473,36 @@ fn go_pointer_conversion_project() -> TempDir {
     dir
 }
 
+fn go_top_level_closure_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::write(dir.path().join("go.mod"), "module example.com/proj\n").expect("write go.mod");
+    fs::write(
+        dir.path().join("factory.go"),
+        "package main\n\nfunc Wire() error { return nil }\n",
+    )
+    .expect("write factory");
+    fs::write(
+        dir.path().join("root.go"),
+        concat!(
+            "package main\n\n",
+            "type Cmd struct{ RunE func() error }\n\n",
+            "var rootCmd = &Cmd{\n",
+            "    RunE: func() error { return Wire() },\n",
+            "}\n",
+        ),
+    )
+    .expect("write root");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn single_file_call_graph_project(file_name: &str, source: &str) -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     fs::write(dir.path().join(file_name), source).expect("write source file");
@@ -2289,6 +2319,27 @@ fn affected_follows_go_parenthesized_pointer_conversion() {
         value["affectedTests"],
         serde_json::json!(["use.go"]),
         "expected (*Wrapped)(x) conversion to make use.go affected:\n{value}"
+    );
+}
+
+#[test]
+fn go_top_level_closure_call_is_attributed_to_variable() {
+    let dir = go_top_level_closure_project();
+    let output = run_codegraph(&["callers", "Wire", "--json"], dir.path());
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("callers stdout is json");
+    let callers = value["callers"].as_array().expect("callers array");
+
+    assert!(
+        callers
+            .iter()
+            .any(|node| node["kind"] == "variable" && node["name"] == "rootCmd"),
+        "expected rootCmd variable to call Wire:\n{value}"
+    );
+    assert!(
+        callers.iter().all(|node| node["kind"] != "file"),
+        "closure call must not be attributed to a file node:\n{value}"
     );
 }
 

@@ -60,6 +60,11 @@ static GO_TYPE_CONVERSION_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid Go type conversion regex")
 });
 
+static GO_VAR_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)^[ \t]*var\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b[^\n]*"#)
+        .expect("valid Go variable regex")
+});
+
 static RUBY_METHOD_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?m)^[ \t]*def\s+(?P<name>(?:self\.)?[A-Za-z_][A-Za-z0-9_!?=]*)"#)
         .expect("valid Ruby method regex")
@@ -497,9 +502,11 @@ impl CodeParser {
     fn extract_go(source: &str, file_path: &str, result: &mut ExtractionResult) {
         let masked_source = mask_c_family_noise(source);
         let mut functions = Vec::new();
-        let mut function_ranges = Vec::new();
+        let mut scoped_ranges = Vec::new();
 
         Self::extract_go_types(source, file_path, result);
+        let variables = Self::extract_go_variables(source, &masked_source, file_path, result);
+        scoped_ranges.extend(variables.iter().map(|span| (span.body_start, span.body_end)));
 
         for captures in GO_FUNCTION_RE.captures_iter(&masked_source) {
             let Some(full_match) = captures.get(0) else {
@@ -554,55 +561,18 @@ impl CodeParser {
                 body_start: open_brace + 1,
                 body_end: close_brace,
             });
-            function_ranges.push((full_match.start(), close_brace + 1));
+            scoped_ranges.push((full_match.start(), close_brace + 1));
+        }
+
+        for variable in &variables {
+            Self::extract_go_refs_in_span(source, &masked_source, file_path, result, variable);
         }
 
         for function in &functions {
             if function.body_start >= function.body_end || function.body_end > masked_source.len() {
                 continue;
             }
-            push_go_composite_refs(
-                source,
-                &masked_source,
-                file_path,
-                result,
-                &function.id,
-                function.body_start,
-                function.body_end,
-                None,
-            );
-            push_go_type_conversion_refs(
-                source,
-                &masked_source,
-                file_path,
-                result,
-                &function.id,
-                function.body_start,
-                function.body_end,
-            );
-            let body = &masked_source[function.body_start..function.body_end];
-            for captures in GO_CALL_RE.captures_iter(body) {
-                let Some(callee_match) = captures.name("callee") else {
-                    continue;
-                };
-                let callee = normalize_go_callee(callee_match.as_str());
-                if callee.is_empty() || is_go_keyword(&callee) {
-                    continue;
-                }
-                let call_start = function.body_start + callee_match.start();
-                let (line, col) = byte_position(source, call_start);
-                result.unresolved_refs.push(UnresolvedReference {
-                    id: Some(0),
-                    from_node_id: function.id.clone(),
-                    reference_name: callee,
-                    reference_kind: "call".to_string(),
-                    line,
-                    col,
-                    candidates: None,
-                    file_path: file_path.to_string(),
-                    language: Language::Go.as_str().to_string(),
-                });
-            }
+            Self::extract_go_refs_in_span(source, &masked_source, file_path, result, function);
         }
 
         push_go_composite_refs(
@@ -613,7 +583,44 @@ impl CodeParser {
             &format!("{}::[file]", file_path),
             0,
             masked_source.len(),
-            Some(&function_ranges),
+            Some(&scoped_ranges),
+        );
+    }
+
+    fn extract_go_refs_in_span(
+        source: &str,
+        masked_source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+        span: &CFamilyFunctionSpan,
+    ) {
+        push_go_composite_refs(
+            source,
+            masked_source,
+            file_path,
+            result,
+            &span.id,
+            span.body_start,
+            span.body_end,
+            None,
+        );
+        push_go_type_conversion_refs(
+            source,
+            masked_source,
+            file_path,
+            result,
+            &span.id,
+            span.body_start,
+            span.body_end,
+        );
+        push_go_call_refs(
+            source,
+            masked_source,
+            file_path,
+            result,
+            &span.id,
+            span.body_start,
+            span.body_end,
         );
     }
 
@@ -646,6 +653,62 @@ impl CodeParser {
             node.is_exported = is_go_exported(&name);
             result.nodes.push(node);
         }
+    }
+
+    fn extract_go_variables(
+        source: &str,
+        masked_source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) -> Vec<CFamilyFunctionSpan> {
+        let mut variables = Vec::new();
+        for captures in GO_VAR_RE.captures_iter(masked_source) {
+            let Some(full_match) = captures.get(0) else {
+                continue;
+            };
+            let Some(name_match) = captures.name("name") else {
+                continue;
+            };
+            let line = &masked_source[full_match.start()..full_match.end()];
+            let Some(equals_offset) = line.find('=') else {
+                continue;
+            };
+
+            let name = name_match.as_str().to_string();
+            let init_start = full_match.start() + equals_offset + 1;
+            let init_end = go_initializer_end(masked_source, init_start, full_match.end());
+            let (start_line, start_col) = byte_position(source, name_match.start());
+            let (end_line, end_col) = byte_position(source, init_end);
+            let id = format!("{}::{}#{}", file_path, name, start_line);
+            let init_value = source[init_start.min(source.len())..init_end.min(source.len())]
+                .trim()
+                .chars()
+                .take(100)
+                .collect::<String>();
+            let mut node = Node::new(
+                id.clone(),
+                NodeKind::Variable,
+                name.clone(),
+                format!("{}::{}", file_path, name),
+                file_path.to_string(),
+                Language::Go,
+                start_line,
+                end_line,
+                start_col,
+                end_col,
+            );
+            if !init_value.is_empty() {
+                node.signature = Some(format!("= {}", init_value));
+            }
+            node.is_exported = is_go_exported(&name);
+            result.nodes.push(node);
+            variables.push(CFamilyFunctionSpan {
+                id,
+                body_start: init_start,
+                body_end: init_end,
+            });
+        }
+        variables
     }
 
     fn extract_c_family(
@@ -1199,6 +1262,59 @@ fn push_go_type_conversion_refs(
             language: Language::Go.as_str().to_string(),
         });
     }
+}
+
+fn push_go_call_refs(
+    source: &str,
+    masked_source: &str,
+    file_path: &str,
+    result: &mut ExtractionResult,
+    from_node_id: &str,
+    start: usize,
+    end: usize,
+) {
+    if start >= end || end > masked_source.len() {
+        return;
+    }
+
+    let body = &masked_source[start..end];
+    for captures in GO_CALL_RE.captures_iter(body) {
+        let Some(callee_match) = captures.name("callee") else {
+            continue;
+        };
+        let callee = normalize_go_callee(callee_match.as_str());
+        if callee.is_empty() || is_go_keyword(&callee) {
+            continue;
+        }
+
+        let call_start = start + callee_match.start();
+        let (line, col) = byte_position(source, call_start);
+        result.unresolved_refs.push(UnresolvedReference {
+            id: Some(0),
+            from_node_id: from_node_id.to_string(),
+            reference_name: callee,
+            reference_kind: "call".to_string(),
+            line,
+            col,
+            candidates: None,
+            file_path: file_path.to_string(),
+            language: Language::Go.as_str().to_string(),
+        });
+    }
+}
+
+fn go_initializer_end(source: &str, init_start: usize, line_end: usize) -> usize {
+    let bounded_start = init_start.min(source.len());
+    let bounded_line_end = line_end.min(source.len());
+    if let Some(offset) = source[bounded_start..].find('{') {
+        let open_brace = bounded_start + offset;
+        if open_brace < bounded_line_end {
+            if let Some(close_brace) = find_matching_brace(source, open_brace) {
+                return (close_brace + 1).min(source.len());
+            }
+        }
+    }
+    bounded_line_end
 }
 
 fn is_go_named_composite_literal(source: &str, name_start: usize) -> bool {
