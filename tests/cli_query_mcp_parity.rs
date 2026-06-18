@@ -854,6 +854,40 @@ fn rust_use_collision_project() -> TempDir {
     dir
 }
 
+fn rust_struct_literal_project() -> TempDir {
+    let dir = tempfile::tempdir().expect("temp project");
+    fs::create_dir_all(dir.path().join("src")).expect("create src");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write cargo");
+    fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub mod types;\npub mod consumer;\n",
+    )
+    .expect("write lib");
+    fs::write(
+        dir.path().join("src").join("types.rs"),
+        "pub struct Widget { pub n: i32 }\n",
+    )
+    .expect("write types");
+    fs::write(
+        dir.path().join("src").join("consumer.rs"),
+        "pub fn build() -> crate::types::Widget { crate::types::Widget { n: 1 } }\n",
+    )
+    .expect("write consumer");
+
+    let init = run_codegraph(&["init", "--verbose"], dir.path());
+    assert!(
+        init.status.success(),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&init),
+        stderr(&init)
+    );
+    dir
+}
+
 fn java_annotation_project() -> TempDir {
     let dir = tempfile::tempdir().expect("temp project");
     fs::create_dir_all(dir.path().join("p")).expect("create p");
@@ -2239,6 +2273,24 @@ fn affected_resolves_rust_pub_use_to_qualified_module_path() {
         slow_value["affectedTests"],
         serde_json::json!([]),
         "hub.rs must not depend on slow.rs:\n{slow_value}"
+    );
+}
+
+#[test]
+fn affected_follows_rust_struct_literal_instantiation() {
+    let dir = rust_struct_literal_project();
+    let output = run_codegraph(
+        &["affected", "src/types.rs", "--json", "--depth", "5", "--filter", "src/consumer.rs"],
+        dir.path(),
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("affected stdout is json");
+
+    assert_eq!(
+        value["affectedTests"],
+        serde_json::json!(["src/consumer.rs"]),
+        "expected Widget struct literal to make consumer.rs affected:\n{value}"
     );
 }
 

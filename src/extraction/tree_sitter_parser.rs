@@ -174,6 +174,11 @@ impl TreeSitterParser {
                     self.extract_rust_use(node, source, file_path, result);
                 }
             }
+            "struct_expression" => {
+                if *lang == Language::Rust {
+                    self.extract_rust_struct_expression(node, source, file_path, result);
+                }
+            }
 
             // Call expressions (for call edges)
             "call_expression" => {
@@ -748,6 +753,37 @@ impl TreeSitterParser {
         });
     }
 
+    fn extract_rust_struct_expression(
+        &self,
+        node: TSTreeSitterNode,
+        source: &str,
+        file_path: &str,
+        result: &mut ExtractionResult,
+    ) {
+        let Some(name_node) = node.child_by_field_name("name").or_else(|| node.named_child(0)) else {
+            return;
+        };
+        let reference_name = rust_type_leaf_name(&self.get_node_text(name_node, source));
+        if reference_name.is_empty() {
+            return;
+        }
+        let Some(from_node_id) = self.find_enclosing_function_id(node, source, file_path) else {
+            return;
+        };
+
+        result.unresolved_refs.push(UnresolvedReference {
+            id: Some(0),
+            from_node_id,
+            reference_name,
+            reference_kind: "instantiation".to_string(),
+            line: (node.start_position().row + 1) as u32,
+            col: node.start_position().column as u32,
+            candidates: None,
+            file_path: file_path.to_string(),
+            language: Language::Rust.as_str().to_string(),
+        });
+    }
+
     fn extract_call(
         &self,
         node: TSTreeSitterNode,
@@ -884,6 +920,18 @@ impl TreeSitterParser {
             }
         }
     }
+}
+
+fn rust_type_leaf_name(raw_name: &str) -> String {
+    raw_name
+        .split("::")
+        .last()
+        .unwrap_or(raw_name)
+        .split('<')
+        .next()
+        .unwrap_or(raw_name)
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
